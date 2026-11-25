@@ -814,6 +814,40 @@ pub struct PlaylistRef {
     pub id: String,
     pub name: String,
     pub total: u64,
+    /// The playlist's own cover, when the account endpoint reported one.
+    pub art: Art,
+}
+
+/// Spotify cover art comes either as `images` (Web API objects) or as
+/// `coverArt.sources` (the embed page). Both shapes are read here; an empty
+/// result is what paints the generated gradient placeholder.
+fn art_of(value: &Value) -> Art {
+    let mut images = Vec::new();
+    if let Some(list) = value.get("images").and_then(Value::as_array) {
+        images = images_of(list);
+    }
+    if images.is_empty() {
+        if let Some(list) = value
+            .pointer("/coverArt/sources")
+            .and_then(Value::as_array)
+        {
+            images = images_of(list);
+        }
+    }
+    Art::new(images)
+}
+
+fn images_of(list: &[Value]) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    for img in list {
+        let url = img.get("url").and_then(Value::as_str).unwrap_or_default();
+        if url.is_empty() {
+            continue;
+        }
+        let width = img.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+        out.push((width, url.to_string()));
+    }
+    out
 }
 
 pub fn parse_playlists(json: &str) -> Result<(Vec<PlaylistRef>, Option<String>), String> {
@@ -838,6 +872,7 @@ pub fn parse_playlists(json: &str) -> Result<(Vec<PlaylistRef>, Option<String>),
                 id: id.to_string(),
                 name: name.to_string(),
                 total,
+                art: art_of(p),
             });
         }
     }
@@ -891,7 +926,8 @@ pub fn parse_items(json: &str) -> Result<(Vec<ImportedTrack>, Option<String>), S
                 album,
                 secs: (ms / 1000) as u32,
                 added: String::new(),
-                art: Art::default(),
+                // A track wears its album's cover, exactly like the client.
+                art: item.get("album").map(art_of).unwrap_or_default(),
             });
         }
     }
@@ -974,14 +1010,14 @@ pub fn parse_embed(html: &str) -> Result<ImportedPlaylist, String> {
                 album: "Spotify".to_string(),
                 secs,
                 added: String::new(),
-                art: Art::default(),
+                art: art_of(item),
             });
         }
     }
     Ok(ImportedPlaylist {
         name,
         tracks,
-        art: Art::default(),
+        art: art_of(entity),
     })
 }
 
@@ -1051,7 +1087,7 @@ pub fn fetch_all_at<H: Http>(
     for p in refs.iter().take(200) {
         if p.total == 0 {
             out.push(ImportedPlaylist {
-                art: Art::default(),
+                art: p.art.clone(),
                 name: p.name.clone(),
                 tracks: Vec::new(),
             });
@@ -1086,7 +1122,7 @@ pub fn fetch_all_at<H: Http>(
             next = following;
         }
         out.push(ImportedPlaylist {
-            art: Art::default(),
+            art: p.art.clone(),
             name: p.name.clone(),
             tracks,
         });
@@ -1254,6 +1290,8 @@ pub fn import_csv(text: &str, name: &str) -> Result<ImportedPlaylist, String> {
     let artist_i = find(&["artist name", "artist"]).ok_or("no Artist Name column")?;
     let album_i = find(&["album name", "album"]).unwrap_or(title_i);
     let duration_i = find(&["duration"]);
+    // Exportify ships the cover URL as its own column.
+    let art_i = find(&["album image url", "image url", "cover"]);
 
     let mut tracks = Vec::new();
     for row in &rows[1..] {
@@ -1274,7 +1312,10 @@ pub fn import_csv(text: &str, name: &str) -> Result<ImportedPlaylist, String> {
                 .find(|c| is_date(c))
                 .cloned()
                 .unwrap_or_default(),
-            art: Art::default(),
+            art: art_i
+                .and_then(|i| row.get(i))
+                .map(|u| Art::of(u))
+                .unwrap_or_default(),
         });
     }
     if tracks.is_empty() {

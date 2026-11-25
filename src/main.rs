@@ -390,6 +390,9 @@ struct App {
     /// A device the owner picked by hand. It outranks the in-app player until
     /// it disappears from the list.
     picked_device: Option<String>,
+    /// One cover backfill per launch, so a missing image is not retried on
+    /// every repaint or every session poll.
+    covers_asked: bool,
     /// When a token was last asked for / handed to the player.
     web_token_asked: Option<std::time::Instant>,
     web_token_at: Option<std::time::Instant>,
@@ -614,6 +617,7 @@ impl App {
             picked_device: None,
             web_token_asked: None,
             web_token_at: None,
+            covers_asked: false,
             notice: None,
             preview: preview::Queue::new(),
             previewing: false,
@@ -710,6 +714,7 @@ impl App {
             picked_device: None,
             web_token_asked: None,
             web_token_at: None,
+            covers_asked: false,
             notice: None,
             preview: preview::Queue::disabled(),
             previewing: false,
@@ -3027,6 +3032,33 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 
+    /// Fills album covers for imported rows that predate cover storage. One
+    /// Spotify search per missing row, once per launch, off the UI thread.
+    fn request_missing_covers(&mut self) {
+        if self.covers_asked || self.connect.is_none() {
+            return;
+        }
+        let mut jobs = Vec::new();
+        for (pi, p) in self.imported.iter().enumerate() {
+            for (ti, t) in p.tracks.iter().enumerate() {
+                if t.art.is_empty() && !t.title.trim().is_empty() {
+                    jobs.push((
+                        pi,
+                        ti,
+                        format!("{} {}", t.title.trim(), t.artist.trim()),
+                    ));
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        self.covers_asked = true;
+        if let Some(tx) = &self.conn_tx {
+            let _ = tx.send(conn_worker::Request::Covers(jobs));
+        }
+    }
+
     fn connect_command(&mut self, command: connect::Command) {
         if let Some(tx) = &self.conn_tx {
             let _ = tx.send(conn_worker::Request::Api(command));
@@ -3238,6 +3270,41 @@ impl App {
                         self.web_token_asked = None;
                     }
                     Ok(conn_worker::Out::Token(Err(e))) => self.web_error = Some(e),
+                    Ok(conn_worker::Out::Cover(pi, ti, art)) => {
+                        let mut name = String::new();
+                        let mut title = String::new();
+                        let mut artist = String::new();
+                        if let Some(p) = self.imported.get_mut(pi) {
+                            name = p.name.clone();
+                            if let Some(t) = p.tracks.get_mut(ti) {
+                                t.art = art.clone();
+                                title = t.title.clone();
+                                artist = t.artist.clone();
+                            }
+                            if p.art.is_empty() {
+                                if let Some(first) = p.tracks.iter().find(|t| !t.art.is_empty()) {
+                                    p.art = first.art.clone();
+                                }
+                            }
+                        }
+                        // The visible library is a separate tree, so the row
+                        // is matched by what it shows.
+                        if let Some(coll) = self.lib.iter_mut().find(|c| c.name == name) {
+                            if let Some(t) = coll
+                                .tracks
+                                .iter_mut()
+                                .find(|t| t.title == title && t.artist == artist)
+                            {
+                                t.art = art.clone();
+                            }
+                            if coll.art.is_empty() {
+                                coll.art = art;
+                            }
+                        }
+                    }
+                    Ok(conn_worker::Out::CoversDone) => {
+                        crate::spotify::save(&self.imports_path, &self.imported);
+                    }
                     Ok(conn_worker::Out::Devices(Ok(list))) => {
                         if self
                             .picked_device
@@ -5038,6 +5105,7 @@ impl App {
         self.poll_import(ctx);
         self.poll_connect(ctx);
         self.tick_web_player(ctx);
+        self.request_missing_covers();
         self.poll_preview(ctx);
         self.tick_search(ctx);
         self.sync_background(ctx);
@@ -5884,6 +5952,9 @@ mod conn_worker {
         PlaySearch(Result<Vec<crate::catalog::Hit>, String>),
         Dead(String),
         Token(Result<String, String>),
+        /// One album cover found for an imported row.
+        Cover(usize, usize, crate::library::Art),
+        CoversDone,
     }
 
     /// What the window can ask the worker for: a playback command, the list of
@@ -5897,6 +5968,8 @@ mod conn_worker {
         PlaySearch(String),
         /// An access token for the in-app player page.
         Token,
+        /// Imported rows that still need a cover, as (playlist, track, query).
+        Covers(Vec<(usize, usize, String)>),
     }
 
     pub struct Link {
@@ -6016,6 +6089,45 @@ mod conn_worker {
                                     }
                                 }
                             }
+                        }
+                        Ok(Request::Covers(jobs)) => {
+                            // Covers are looked up on their own thread so a
+                            // long backfill never delays a play command.
+                            let session = session.clone();
+                            let store = store.clone();
+                            let out = out_tx.clone();
+                            std::thread::spawn(move || {
+                                let http = spotify::Curl;
+                                for (pi, ti, query) in jobs {
+                                    let result = step(&session, &store, |s| {
+                                        crate::catalog::search(
+                                            &http,
+                                            &s.endpoints.api,
+                                            &s.tokens.access,
+                                            &query,
+                                        )
+                                    });
+                                    match result {
+                                        Ok(hits) => {
+                                            let found = hits.into_iter().find(|h| {
+                                                h.kind == crate::catalog::HitKind::Track
+                                                    && !h.art.is_empty()
+                                            });
+                                            if let Some(hit) = found {
+                                                if out.send(Out::Cover(pi, ti, hit.art)).is_err() {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        Err(e) if connect::fatal(&e) => {
+                                            let _ = out.send(Out::Dead(e));
+                                            return;
+                                        }
+                                        Err(_) => {}
+                                    }
+                                }
+                                let _ = out.send(Out::CoversDone);
+                            });
                         }
                         Ok(Request::Devices) => {
                             let result = step(&session, &store, |s| {
