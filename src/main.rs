@@ -4162,16 +4162,22 @@ impl App {
                     }
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
                     th::volume_icon(ui.painter(), r, t.muted);
-                    if let Some(f) = bar(ui, &t, self.volume, 96.0) {
+                    let (picked, released) = bar_drag(ui, &t, self.volume, 96.0);
+                    if let Some(f) = picked {
                         self.volume = f;
                         self.profile.volume = f;
+                        // The local sink is what previews and files play
+                        // through, so it always follows the slider. Spotify
+                        // gets its own copy while it owns the transport.
+                        self.audio.set_volume(f);
                         if self.spotify_playing() {
                             self.connect_command(connect::Command::Volume(
                                 (f * 100.0).round().clamp(0.0, 100.0) as u8,
                             ));
-                        } else {
-                            self.audio.set_volume(f);
                         }
+                    }
+                    if released {
+                        self.save_profile();
                     }
                     ui.label(
                         RichText::new(format!("{}%", (self.volume * 100.0).round() as i32))
@@ -5666,6 +5672,12 @@ fn icon_btn(ui: &mut egui::Ui, t: &Theme, kind: Icon, active: bool) -> egui::Res
 
 /// Click/drag bar. Returns the new fraction (0..1) when the user seeks.
 fn bar(ui: &mut egui::Ui, t: &Theme, frac: f32, width: f32) -> Option<f32> {
+    bar_drag(ui, t, frac, width).0
+}
+
+/// The same bar, plus whether the pointer was released this frame, so a caller
+/// can write the value once at the end of a drag instead of every frame.
+fn bar_drag(ui: &mut egui::Ui, t: &Theme, frac: f32, width: f32) -> (Option<f32>, bool) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 16.0), Sense::click_and_drag());
     let p = ui.painter();
     let cy = rect.center().y;
@@ -5681,12 +5693,13 @@ fn bar(ui: &mut egui::Ui, t: &Theme, frac: f32, width: f32) -> Option<f32> {
     if active {
         p.circle_filled(egui::pos2(rail.left() + rail.width() * f, cy), 6.0, t.text);
     }
+    let mut value = None;
     if let Some(pos) = resp.interact_pointer_pos() {
         if resp.clicked() || resp.dragged() {
-            return Some(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0));
+            value = Some(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0));
         }
     }
-    None
+    (value, resp.drag_stopped())
 }
 
 /// Background playback control. One worker owns the Spotify session, so a token
@@ -5849,6 +5862,10 @@ mod conn_worker {
                             }
                         }
                         Ok(Request::Api(cmd)) => {
+                            // Volume is best effort. Several Spotify devices
+                            // ignore it, and that is not a connection failure
+                            // worth painting the window red for.
+                            let quiet = matches!(&cmd, connect::Command::Volume(_));
                             let result = step(&session, &store, |s| {
                                 connect::command(&http, &s.endpoints.api, &s.tokens.access, cmd)
                             });
@@ -5861,6 +5878,11 @@ mod conn_worker {
                                 Err(e) if connect::fatal(&e) => {
                                     let _ = out_tx.send(Out::Dead(e));
                                     return;
+                                }
+                                Err(_) if quiet => {
+                                    if out_tx.send(Out::Cmd(Ok(()))).is_err() {
+                                        return;
+                                    }
                                 }
                                 Err(e) => {
                                     if out_tx.send(Out::Cmd(Err(e))).is_err() {
