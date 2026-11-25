@@ -15,6 +15,7 @@ mod fake_spotify;
 mod taste;
 mod theme;
 mod themefile;
+mod webplayer;
 
 use eframe::egui::{self, Align, Align2, Color32, Layout, Rect, RichText, Sense, Stroke, Vec2};
 use art as artwork;
@@ -378,6 +379,20 @@ struct App {
     theme_file: themefile::Watch,
     devices: Vec<connect::Device>,
     show_devices: bool,
+    /// Spotify's own player inside a hidden webview: full songs without the
+    /// desktop app. None until the window exists and the session is attached.
+    web: Option<webplayer::Player>,
+    /// One start attempt per run; a failure falls back to device playback.
+    web_tried: bool,
+    web_error: Option<String>,
+    /// Device id the SDK reported. Preferred for every play command.
+    web_device: Option<String>,
+    /// A device the owner picked by hand. It outranks the in-app player until
+    /// it disappears from the list.
+    picked_device: Option<String>,
+    /// When a token was last asked for / handed to the player.
+    web_token_asked: Option<std::time::Instant>,
+    web_token_at: Option<std::time::Instant>,
     /// One-line reason an action could not make sound, shown in the player
     /// bar for a few seconds so a click never ends in unexplained silence.
     notice: Option<(String, std::time::Instant)>,
@@ -592,6 +607,13 @@ impl App {
             theme_file,
             devices: Vec::new(),
             show_devices: false,
+            web: None,
+            web_tried: false,
+            web_error: None,
+            web_device: None,
+            picked_device: None,
+            web_token_asked: None,
+            web_token_at: None,
             notice: None,
             preview: preview::Queue::new(),
             previewing: false,
@@ -681,6 +703,13 @@ impl App {
             theme_file,
             devices: Vec::new(),
             show_devices: false,
+            web: None,
+            web_tried: false,
+            web_error: None,
+            web_device: None,
+            picked_device: None,
+            web_token_asked: None,
+            web_token_at: None,
             notice: None,
             preview: preview::Queue::disabled(),
             previewing: false,
@@ -2695,6 +2724,17 @@ impl App {
 
     /// Device a play command should go to, preferring the one already playing.
     fn spotify_device_id(&self) -> Option<String> {
+        // A device the owner picked by hand wins; otherwise the SDK player is
+        // the point of this build, so every play goes there without the
+        // desktop app having to be awake.
+        if let Some(id) = &self.picked_device {
+            if self.devices.iter().any(|d| &d.id == id) {
+                return Some(id.clone());
+            }
+        }
+        if let Some(id) = &self.web_device {
+            return Some(id.clone());
+        }
         self.devices
             .iter()
             .find(|d| d.active)
@@ -2856,6 +2896,8 @@ impl App {
     fn attach_session(&mut self, session: connect::Session) {
         let link = conn_worker::spawn(session.clone(), connect::default_path());
         self.connect = Some(session);
+        self.web_tried = false;
+        self.picked_device = None;
         self.conn_tx = Some(link.cmds);
         self.conn_rx = Some(link.out);
         self.spotify_mode = true;
@@ -2896,6 +2938,93 @@ impl App {
         self.detach_spotify("");
         self.connect_log
             .push_str("Disconnected and deleted the saved Spotify session.\n");
+    }
+
+    /// Starts the hidden WebView2 player once a session is attached, answers
+    /// its token requests, and remembers the device Spotify gives it.
+    fn tick_web_player(&mut self, ctx: &egui::Context) {
+        if self.connect.is_none() {
+            self.web = None;
+            self.web_device = None;
+            return;
+        }
+        if !self.web_tried {
+            self.web_tried = true;
+            match webplayer::Player::start() {
+                Ok(web) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!("webplayer: started");
+                    }
+                    self.web = Some(web);
+                    self.web_error = None;
+                }
+                Err(e) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!("webplayer: start failed: {e}");
+                    }
+                    self.web_error = Some(e);
+                }
+            }
+        }
+        let Some(web) = &mut self.web else {
+            return;
+        };
+        for event in web.poll() {
+            if cfg!(debug_assertions) {
+                let line = match &event {
+                    webplayer::Event::Ready(id) => format!("ready {id}"),
+                    webplayer::Event::NotReady => "not ready".to_string(),
+                    webplayer::Event::Auth(m) => format!("auth error: {m}"),
+                    webplayer::Event::Account(m) => format!("account error: {m}"),
+                    webplayer::Event::Error(m) => format!("error: {m}"),
+                };
+                eprintln!("webplayer: {line}");
+            }
+            match event {
+                webplayer::Event::Ready(id) => {
+                    self.web_device = Some(id);
+                    self.web_error = None;
+                }
+                webplayer::Event::NotReady => self.web_device = None,
+                webplayer::Event::Auth(msg) => {
+                    self.web_error = Some(format!(
+                        "Spotify rejected the in-app player ({msg}). Reconnect to allow playback."
+                    ));
+                }
+                webplayer::Event::Account(msg) => {
+                    self.web_error = Some(format!(
+                        "This account cannot use the in-app player ({msg}). Premium is required."
+                    ));
+                }
+                webplayer::Event::Error(msg) => {
+                    self.web_error = Some(format!("In-app player: {msg}"));
+                }
+            }
+        }
+        // The page fetches its token from the bridge and picks up replacements,
+        // so hand it one as soon as it is needed and refresh well before the
+        // hour Spotify gives each token.
+        if self
+            .web_token_at
+            .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(45 * 60))
+        {
+            if let Some(web) = &self.web {
+                web.clear_token();
+            }
+            self.web_token_at = None;
+        }
+        let needs = self.web.as_ref().is_some_and(|w| w.needs_token());
+        if needs
+            && self
+                .web_token_asked
+                .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(5))
+        {
+            if let Some(tx) = &self.conn_tx {
+                let _ = tx.send(conn_worker::Request::Token);
+                self.web_token_asked = Some(std::time::Instant::now());
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 
     fn connect_command(&mut self, command: connect::Command) {
@@ -3101,7 +3230,24 @@ impl App {
                         }
                     }
                     Ok(conn_worker::Out::Cmd(Ok(()))) => self.connect_error = None,
-                    Ok(conn_worker::Out::Devices(Ok(list))) => self.devices = list,
+                    Ok(conn_worker::Out::Token(Ok(token))) => {
+                        if let Some(web) = &self.web {
+                            web.set_token(&token);
+                        }
+                        self.web_token_at = Some(std::time::Instant::now());
+                        self.web_token_asked = None;
+                    }
+                    Ok(conn_worker::Out::Token(Err(e))) => self.web_error = Some(e),
+                    Ok(conn_worker::Out::Devices(Ok(list))) => {
+                        if self
+                            .picked_device
+                            .as_ref()
+                            .is_some_and(|id| !list.iter().any(|d| &d.id == id))
+                        {
+                            self.picked_device = None;
+                        }
+                        self.devices = list;
+                    }
                     Ok(conn_worker::Out::PlaySearch(Ok(hits))) => {
                         match hits
                             .into_iter()
@@ -3367,6 +3513,17 @@ impl App {
                             self.disconnect_spotify();
                         }
                     });
+                    ui.add_space(4.0);
+                    let (web_text, web_color) = match (&self.web_error, &self.web_device) {
+                        (Some(err), _) => (err.clone(), Color32::from_rgb(0xff, 0x6b, 0x6b)),
+                        (None, Some(_)) => (
+                            "In-app player ready: full songs play here, no desktop app needed."
+                                .to_string(),
+                            t.accent,
+                        ),
+                        (None, None) => ("Starting the in-app player...".to_string(), t.muted),
+                    };
+                    ui.label(RichText::new(web_text).size(11.5).color(web_color));
                     ui.add_space(4.0);
                     let status = match (&self.connect_error, &self.connect_playback) {
                         (Some(err), _) => err.clone(),
@@ -4418,6 +4575,7 @@ impl App {
             // playing from this PC.
             self.local_override = false;
             self.audio.stop();
+            self.picked_device = Some(id.clone());
             self.connect_command(connect::Command::Transfer(id));
             self.show_devices = false;
         }
@@ -4879,6 +5037,7 @@ impl App {
         self.player_frames += 1;
         self.poll_import(ctx);
         self.poll_connect(ctx);
+        self.tick_web_player(ctx);
         self.poll_preview(ctx);
         self.tick_search(ctx);
         self.sync_background(ctx);
@@ -5724,6 +5883,7 @@ mod conn_worker {
         Search(Result<Vec<crate::catalog::Hit>, String>),
         PlaySearch(Result<Vec<crate::catalog::Hit>, String>),
         Dead(String),
+        Token(Result<String, String>),
     }
 
     /// What the window can ask the worker for: a playback command, the list of
@@ -5735,6 +5895,8 @@ mod conn_worker {
         /// Search for a library row that has no stored Spotify URI, then play
         /// the best track match.
         PlaySearch(String),
+        /// An access token for the in-app player page.
+        Token,
     }
 
     pub struct Link {
@@ -5835,6 +5997,21 @@ mod conn_worker {
                                 }
                                 Err(e) => {
                                     if out_tx.send(Out::PlaySearch(Err(e))).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Request::Token) => {
+                            let result = step(&session, &store, |s| Ok(s.tokens.access.clone()));
+                            match result {
+                                Ok(token) => {
+                                    if out_tx.send(Out::Token(Ok(token))).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    if out_tx.send(Out::Token(Err(e))).is_err() {
                                         return;
                                     }
                                 }

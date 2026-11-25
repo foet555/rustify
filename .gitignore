@@ -9,3 +9,11 @@ Thumbs.db
 /small9.png
 /preview.png
 /preview-local.png
+/import.png
+/play*.png
+/bar*.png
+/clean*.png
+/web-debug.out
+
+# WebView2's per-exe profile cache.
+*.WebView2

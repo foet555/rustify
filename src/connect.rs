@@ -14,7 +14,15 @@ use crate::spotify::{self, Curl, Endpoints, HttpResponse, Options};
 
 /// Playback control alone. Kept apart from the import scopes so a login is
 /// never asked for more than the feature being turned on.
-pub const SCOPES: &str = "user-read-playback-state user-modify-playback-state";
+/// `streaming` is what the in-app Web Playback SDK needs; the rest is the
+/// player surface the transport uses.
+pub const SCOPES: &str =
+    "streaming user-read-email user-read-private user-read-playback-state user-modify-playback-state";
+
+/// Bumped whenever SCOPES grows. A saved session from before the change is
+/// dropped so the owner is asked to sign in again, instead of the SDK failing
+/// later on a token that was never allowed to stream.
+const SCOPE_REV: u32 = 2;
 
 /// Anything the module needs from the network, so tests can answer without a
 /// socket and the app can use curl.exe.
@@ -230,6 +238,9 @@ pub fn login<T: Transport>(
     log("Opening Spotify sign-in for playback control...".to_string());
     log(format!("Redirect URI must be exactly {redirect}"));
     log(format!("If no browser opens, paste this URL: {url}"));
+    if cfg!(debug_assertions) {
+        eprintln!("sign-in URL: {url}");
+    }
     if options.open_browser {
         spotify::open_browser(&url);
     }
@@ -492,12 +503,16 @@ fn to_json(session: &Session) -> String {
         "access_token": session.tokens.access,
         "refresh_token": session.tokens.refresh,
         "expires_at_ms": session.tokens.expires_at_ms,
+        "scope_rev": SCOPE_REV,
     })
     .to_string()
 }
 
 fn from_json(text: &str, endpoints: Endpoints, expect_client: &str) -> Option<Session> {
     let v: Value = serde_json::from_str(text).ok()?;
+    if v.get("scope_rev").and_then(Value::as_u64) != Some(SCOPE_REV as u64) {
+        return None;
+    }
     let client_id = v.get("client_id").and_then(Value::as_str)?.to_string();
     // A token minted for a different Spotify app cannot be refreshed by the
     // current Client ID, so treat it as gone rather than failing at runtime.
@@ -989,11 +1004,12 @@ mod tests {
             lines.push(line);
         }
 
-        // Playback control must ask for its own scopes and nothing more.
+        // Playback must ask for its own scopes and nothing more: the player
+        // surface plus what the in-app SDK needs to stream.
         assert!(url.starts_with(&format!("{}/authorize?", fake.base)));
         assert_eq!(
             query_value(&url, "scope"),
-            "user-read-playback-state%20user-modify-playback-state"
+            "streaming%20user-read-email%20user-read-private%20user-read-playback-state%20user-modify-playback-state"
         );
         assert!(url.contains("code_challenge_method=S256"));
 

@@ -2,9 +2,10 @@
 
 A desktop music player for Windows, built in Rust with [egui](https://github.com/emilk/egui).
 
-Rustify plays the audio files on your PC, and it can hand playback over to the Spotify app you
-are already signed into. Full songs only ever play through Spotify itself; anything Rustify plays
-on its own is a file you own or an official 30-second preview.
+Rustify plays the audio files on your PC, and it can play full songs from your Spotify account
+inside its own window: Spotify's Web Playback SDK runs in a hidden WebView2, so the desktop app
+does not have to be open. Spotify still decrypts and streams the audio; Rustify only drives it.
+Anything Rustify plays on its own is a file you own or an official 30-second preview.
 
 ## What it does
 
@@ -12,9 +13,10 @@ on its own is a file you own or an official 30-second preview.
   FLAC, or a folder you pick yourself.
 - **Spotify previews** – a track that is not on your disk streams the official 30-second preview
   that Deezer and iTunes publish. No account needed, nothing is ripped or re-hosted.
-- **Spotify playback control** – with a Spotify app of your own and Premium, Rustify can play,
-  pause, skip, seek and change volume on the Spotify app running on your PC. Spotify plays the
-  audio.
+- **Spotify playback** – with Premium, Rustify hosts Spotify's own Web Playback SDK, so full
+  songs play in Rustify with no desktop app running. Play, pause, skip, seek and volume all go
+  through Spotify's Web API. The device picker can still send playback to your phone or to the
+  Spotify desktop app when you prefer that.
 - **Playlist import** – copy the playlists you own or collaborate on with your own Spotify app,
   add any public playlist by link, or import an Exportify CSV.
 - **Queue, search, likes and play counts** – plus a taste profile that builds itself from what you
@@ -28,7 +30,8 @@ on its own is a file you own or an official 30-second preview.
 |---|---|
 | OS | Windows 10 or 11 (uses the `curl.exe` that ships with Windows, and the Win32 clipboard) |
 | Toolchain | Rust 1.85 or newer (edition 2024) |
-| Spotify | Any account for previews and imports; **Premium** for playback control |
+| Spotify | Any account for previews and imports; **Premium** for full-song playback |
+| WebView2 | The runtime ships with Windows 10/11 (via Edge); Rustify needs it for the in-app player |
 | Optional | Discord desktop app for rich presence |
 
 ## Build and run
@@ -47,6 +50,10 @@ A note on the toolchain: `.cargo/config.toml` adds `vendor/mingw` to the linker 
 `x86_64-pc-windows-gnu` target. It supplies the `bcryptprimitives` import library that some
 MinGW Rust sysroots are missing. With the MSVC toolchain (`rustup default stable-msvc`) the file is
 ignored and you can delete it.
+
+`build.rs` copies `vendor/webview2/WebView2Loader.dll` next to the built exe. That loader is
+required by the WebView2 bindings on the GNU target; without it the program exits at startup with
+a missing-library error. Keep the DLL beside the exe if you move it somewhere else.
 
 ## Connect your Spotify app
 
@@ -67,8 +74,11 @@ once and paste its Client ID into Rustify. There is no client secret involved; P
 4. Open the app's **Basic Information** page and copy the **Client ID**.
 5. In Rustify go to **Import from Spotify** and paste the Client ID into the *Client ID* field.
    It is stored in `%APPDATA%\spotify-rust\taste.txt` and is not a secret.
-6. Click **Connect playback control**. Your browser opens Spotify's consent page; approve the two
-   playback scopes and the tab will report "Rustify is connected".
+6. Click **Connect playback control**. Your browser opens Spotify's consent page; approve the
+   streaming and playback scopes and the tab will report "Rustify is connected".
+
+A session saved by an older build asked for fewer scopes, so Rustify drops it and asks you to
+connect once more. That is expected after an upgrade.
 
 If you ever see `redirect_uri: Not matching configuration`, the URI from step 2 is missing from
 that app's Redirect URIs (or was added but not saved). Fix it in the dashboard and connect again.
@@ -80,13 +90,17 @@ owner needs an active Premium subscription. That is a Spotify restriction, not a
 
 1. Make sure **Use Spotify playback** is ticked on the *Import from Spotify* page (it appears once
    the account is connected).
-2. Open the Spotify desktop app on the same PC and start a song once, so the app has an active
-   device.
-3. Play from Rustify. The commands go to Spotify; the audio, the quality and the device stay
-   Spotify's.
+2. Play from Rustify. A hidden WebView2 connects as a Spotify Connect device named **Rustify** and
+   the track starts there. The *Import from Spotify* page reports "In-app player ready" when the
+   device is live.
+3. To send playback somewhere else, open the device picker in the player bar (the monitor icon)
+   and pick your phone or the desktop app. Your choice sticks until that device disappears; press
+   play again to come back to Rustify's own player.
 
-While that switch is off, or for any track that is not in your Spotify account, Rustify falls back
-to local files and 30-second previews.
+While the Spotify switch is off, or for any track that is not in your Spotify account, Rustify
+falls back to local files and 30-second previews.
+
+Full-song playback needs Spotify Premium, just like any Spotify SDK product.
 
 ## Importing playlists
 
@@ -134,7 +148,10 @@ Deleting that folder resets the app; nothing is stored anywhere else.
 |---|---|
 | `redirect_uri: Not matching configuration` | the callback URL is not saved in the Spotify app's Redirect URIs |
 | `Timed out waiting for Spotify sign-in` | the consent page was closed or never finished; click Connect again |
-| `Open Spotify on this PC and start a song` | Spotify has no active device yet |
+| `In-app player: authentication error` | the saved session predates the streaming scope; Disconnect, then Connect again |
+| `In-app player: account error` | the account is not Premium, so Spotify refuses SDK playback |
+| `Starting the in-app player...` never changes | WebView2 is missing; install the WebView2 Runtime from Microsoft |
+| Playback lands on another device | that device was picked by hand; open the device picker and choose **Rustify** |
 | `spotify-rust.exe` opens a console window | you are running the debug build; use `target/release` |
 | Imports fail with a Client ID error | paste the Client ID first, then reconnect |
 
@@ -146,7 +163,8 @@ cargo build             # debug build with a console for diagnostics
 ```
 
 `src/` is split by area: `main.rs` (UI and state), `spotify.rs` (OAuth, API, imports),
-`connect.rs` (playback control), `preview.rs` (30-second clips), `library.rs`/`catalog.rs`
+`connect.rs` (playback control), `webplayer.rs` (the hidden WebView2 player), `preview.rs`
+(30-second clips), `library.rs`/`catalog.rs`
 (indexing), `audio.rs` (playback), `theme.rs`/`themefile.rs`, `discord.rs`, `profile.rs`,
 `taste.rs`, `art.rs`, `gate.rs`.
 
