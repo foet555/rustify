@@ -7,6 +7,13 @@ inside its own window: Spotify's Web Playback SDK runs in a hidden WebView2, so 
 does not have to be open. Spotify still decrypts and streams the audio; Rustify only drives it.
 Anything Rustify plays on its own is a file you own or an official 30-second preview.
 
+## Download
+
+[**Releases →**](https://github.com/foet555/rustify/releases/latest) has a ready-to-run Windows
+build. Unzip `Rustify-win64.zip` anywhere and run `spotify-rust.exe`; settings are kept in
+`%APPDATA%\spotify-rust`. Full-song playback needs Spotify Premium and a Spotify app Client ID of
+your own — [Connect your Spotify app](#connect-your-spotify-app) walks through it.
+
 ## What it does
 
 - **Local library** – scans Music, Downloads, Desktop and Documents for MP3, WAV, M4A, OGG and
@@ -177,3 +184,8 @@ console, so run them from a terminal with the debug build.
 Rustify does not download, record or redistribute Spotify audio. Previews are the official clips
 Deezer and iTunes publish for exactly this purpose. Full tracks are played by the Spotify client on
 your own account, under Spotify's terms.
+
+## License
+
+MIT — see [LICENSE](LICENSE). You may use, change and share Rustify, including commercially, as
+long as the copyright notice stays with it.

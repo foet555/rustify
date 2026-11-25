@@ -17,3 +17,6 @@ Thumbs.db
 
 # WebView2's per-exe profile cache.
 *.WebView2
+
+# Local release packaging output.
+/dist
