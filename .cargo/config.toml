@@ -1,0 +1,8 @@
+# This rust-mingw sysroot is missing the `libbcryptprimitives.a` import library
+# that std needs for `ProcessPrng` (used to seed hashers and other randomness).
+# Without it every fresh link fails with:
+#   ld: cannot find -lbcryptprimitives
+# `vendor/mingw/libbcryptprimitives.a` is generated from the DLL that ships
+# with Windows (see vendor/mingw/README.txt), so nothing is downloaded.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-L", "native=vendor/mingw"]

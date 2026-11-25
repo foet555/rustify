@@ -1,0 +1,12 @@
+[package]
+name = "spotify-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.31"
+serde_json = "1"
+# Decodes the background photo for custom themes. Already pulled in by eframe,
+# so this only asks for the two formats that matter.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rodio = "0.22.2"
