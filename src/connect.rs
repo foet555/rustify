@@ -14,15 +14,15 @@ use crate::spotify::{self, Curl, Endpoints, HttpResponse, Options};
 
 /// Playback control alone. Kept apart from the import scopes so a login is
 /// never asked for more than the feature being turned on.
-/// `streaming` is what the in-app Web Playback SDK needs; the rest is the
-/// player surface the transport uses.
+/// `streaming` lets the native Connect player stream full tracks; the rest is
+/// the player surface the transport uses.
 pub const SCOPES: &str =
-    "streaming user-read-email user-read-private user-read-playback-state user-modify-playback-state";
+    "streaming user-read-email user-read-private user-read-playback-state user-modify-playback-state playlist-modify-public playlist-modify-private";
 
 /// Bumped whenever SCOPES grows. A saved session from before the change is
-/// dropped so the owner is asked to sign in again, instead of the SDK failing
-/// later on a token that was never allowed to stream.
-const SCOPE_REV: u32 = 2;
+/// dropped so the owner is asked to sign in again, instead of the backend
+/// failing later on a token that was never allowed to stream or edit playlists.
+const SCOPE_REV: u32 = 3;
 
 /// Anything the module needs from the network, so tests can answer without a
 /// socket and the app can use curl.exe.
@@ -126,6 +126,9 @@ pub struct Playback {
     pub duration_ms: u64,
     pub track: String,
     pub artist: String,
+    pub album: String,
+    /// The largest album cover URL Spotify reported, when there is one.
+    pub image: String,
     pub device: String,
     pub volume: Option<u8>,
 }
@@ -155,9 +158,12 @@ pub enum Command {
         uri: String,
         device: Option<String>,
     },
-    /// Play an album or artist from search results, by context URI.
+    /// Play an album, artist or playlist by context URI, optionally starting
+    /// at a row inside it. Spotify then owns the in-order queue and stops at
+    /// the end of the context instead of inventing filler tracks.
     PlayContext {
         uri: String,
+        offset: Option<u32>,
         device: Option<String>,
     },
     /// Append a searched track to the queue.
@@ -343,6 +349,23 @@ fn parse_playback(body: &str) -> Option<Playback> {
                 .join(", ")
         })
         .unwrap_or_default();
+    let album = item.get("album").cloned().unwrap_or(Value::Null);
+    let album_name = album
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let image = album
+        .get("images")
+        .and_then(Value::as_array)
+        .and_then(|list| {
+            list.iter()
+                .filter(|i| i.get("url").and_then(Value::as_str).is_some())
+                .max_by_key(|i| i.get("width").and_then(Value::as_u64).unwrap_or(0))
+                .and_then(|i| i.get("url").and_then(Value::as_str))
+        })
+        .unwrap_or("")
+        .to_string();
     let device = v.get("device").cloned().unwrap_or(Value::Null);
     Some(Playback {
         playing: v.get("is_playing").and_then(Value::as_bool).unwrap_or(false),
@@ -353,6 +376,8 @@ fn parse_playback(body: &str) -> Option<Playback> {
             .unwrap_or(0),
         track,
         artist,
+        album: album_name,
+        image,
         device: device
             .get("name")
             .and_then(Value::as_str)
@@ -458,7 +483,11 @@ pub fn command<T: Transport>(
                 Some(json!({ "uris": [uri] }).to_string()),
             )
         }
-        Command::PlayContext { uri, device } => {
+        Command::PlayContext {
+            uri,
+            offset,
+            device,
+        } => {
             let url = match device {
                 Some(id) if !id.is_empty() => format!(
                     "{api}/me/player/play?device_id={}",
@@ -466,11 +495,11 @@ pub fn command<T: Transport>(
                 ),
                 _ => format!("{api}/me/player/play"),
             };
-            (
-                "PUT",
-                url,
-                Some(json!({ "context_uri": uri }).to_string()),
-            )
+            let mut body = json!({ "context_uri": uri });
+            if let Some(position) = offset {
+                body["offset"] = json!({ "position": position });
+            }
+            ("PUT", url, Some(body.to_string()))
         }
         Command::QueueUri(uri) => (
             "POST",
@@ -483,6 +512,43 @@ pub fn command<T: Transport>(
         return Err(api_error(response.status, &response.body));
     }
     Ok(())
+}
+
+/// A failed playlist edit is not a playback failure, so its 403 explains the
+/// permission instead of talking about Premium audio. Spotify's 2026 endpoint
+/// for removing rows is `DELETE /playlists/{id}/items` with an `items` array.
+pub fn remove_playlist_item<T: Transport>(
+    http: &T,
+    api: &str,
+    token: &str,
+    playlist_id: &str,
+    track_uri: &str,
+) -> Result<(), String> {
+    let playlist_id = playlist_id.trim();
+    let track_uri = track_uri.trim();
+    if playlist_id.is_empty() {
+        return Err("This playlist is not linked to Spotify; import it again from Spotify first.".to_string());
+    }
+    if track_uri.is_empty() {
+        return Err("Spotify did not give this row a track URI; refresh the playlist and try again.".to_string());
+    }
+    let body = json!({ "items": [{ "uri": track_uri }] }).to_string();
+    let url = format!("{api}/playlists/{playlist_id}/items");
+    let response = http.send_json("DELETE", &url, token, Some(&body))?;
+    if !is_ok(&response) {
+        return Err(playlist_error(response.status, &response.body));
+    }
+    Ok(())
+}
+
+fn playlist_error(status: u16, body: &str) -> String {
+    match status {
+        401 => "Spotify sign-in expired; connect playback control again".to_string(),
+        403 => "Spotify refused to edit this playlist. Sign in again and allow playlist editing, and make sure you own the playlist or can collaborate on it.".to_string(),
+        404 => "That playlist is no longer available on Spotify; refresh it from Import.".to_string(),
+        429 => "Spotify is rate limiting requests; wait a moment".to_string(),
+        _ => api_error(status, body),
+    }
 }
 
 // -------------------------------------------------------------- token store
@@ -762,12 +828,62 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_playlist_item_uses_the_2026_items_endpoint() {
+        let fake = Fake::reply(200, "{}");
+        remove_playlist_item(&fake, API, "tok", "pl-1", "spotify:track:abc")
+            .expect("a successful removal");
+        let (method, url, body) = fake.last();
+        assert_eq!(method, "DELETE");
+        assert_eq!(url, format!("{API}/playlists/pl-1/items"));
+        assert_eq!(
+            body.as_deref(),
+            Some(r#"{"items":[{"uri":"spotify:track:abc"}]}"#)
+        );
+    }
+
+    #[test]
+    fn a_refused_playlist_edit_explains_the_permission() {
+        let fake = Fake::reply(403, r#"{"error":{"status":403,"message":"Forbidden"}}"#);
+        let err = remove_playlist_item(&fake, API, "tok", "pl-1", "spotify:track:abc")
+            .expect_err("a refused edit");
+        assert!(err.contains("playlist editing"), "{err}");
+        assert!(!err.contains("Premium"), "a playlist edit is not a Premium error: {err}");
+    }
+
+    #[test]
+    fn a_playlist_context_can_start_at_a_row() {
+        let fake = Fake::reply(204, "");
+        command(
+            &fake,
+            API,
+            "tok",
+            Command::PlayContext {
+                uri: "spotify:playlist:pl-1".to_string(),
+                offset: Some(3),
+                device: Some("dev-1".to_string()),
+            },
+        )
+        .expect("a context play");
+        let (method, url, body) = fake.last();
+        assert_eq!(method, "PUT");
+        assert!(url.contains("/me/player/play"));
+        assert_eq!(
+            body.as_deref(),
+            Some(
+                r#"{"context_uri":"spotify:playlist:pl-1","offset":{"position":3}}"#
+            )
+        );
+    }
+
+    #[test]
     fn state_reads_the_track_the_device_and_the_position() {
-        let body = r#"{"is_playing":true,"progress_ms":61000,"item":{"name":"Nightcall","artists":[{"name":"Kavinsky"}],"duration_ms":258000},"device":{"name":"PDX-PC","volume_percent":64}}"#;
+        let body = r#"{"is_playing":true,"progress_ms":61000,"item":{"name":"Nightcall","artists":[{"name":"Kavinsky"}],"duration_ms":258000,"album":{"name":"OutRun","images":[{"url":"https://i.scdn.co/image/small","width":64},{"url":"https://i.scdn.co/image/large","width":640}]}},"device":{"name":"PDX-PC","volume_percent":64}}"#;
         let fake = Fake::reply(200, body);
         let playing = state(&fake, API, "tok").unwrap().expect("a track");
         assert_eq!(playing.track, "Nightcall");
         assert_eq!(playing.artist, "Kavinsky");
+        assert_eq!(playing.album, "OutRun");
+        assert_eq!(playing.image, "https://i.scdn.co/image/large");
         assert!(playing.playing);
         assert_eq!(playing.progress_ms, 61000);
         assert_eq!(playing.duration_ms, 258000);
@@ -1004,12 +1120,12 @@ mod tests {
             lines.push(line);
         }
 
-        // Playback must ask for its own scopes and nothing more: the player
-        // surface plus what the in-app SDK needs to stream.
+        // Playback asks for the player surface, streaming, and exactly the two
+        // playlist-edit scopes the remove action needs.
         assert!(url.starts_with(&format!("{}/authorize?", fake.base)));
         assert_eq!(
             query_value(&url, "scope"),
-            "streaming%20user-read-email%20user-read-private%20user-read-playback-state%20user-modify-playback-state"
+            "streaming%20user-read-email%20user-read-private%20user-read-playback-state%20user-modify-playback-state%20playlist-modify-public%20playlist-modify-private"
         );
         assert!(url.contains("code_challenge_method=S256"));
 

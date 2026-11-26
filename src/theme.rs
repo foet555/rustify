@@ -8,6 +8,7 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Painter, Pos2, R
 /// family every painted label uses. Globals rather than parameters because
 /// every widget already reaches for these helpers.
 static RADIUS_SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
+static DENSITY: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
 static MONO: AtomicBool = AtomicBool::new(false);
 /// Whole-interface scale from the theme file.
 static ZOOM: AtomicU32 = AtomicU32::new(0x3f80_0000);
@@ -18,6 +19,15 @@ pub fn set_zoom(z: f32) {
 
 pub fn zoom() -> f32 {
     f32::from_bits(ZOOM.load(Ordering::Relaxed))
+}
+
+/// Spacing multiplier for the Rustify-only Compact/Cozy/Spacious option.
+pub fn set_density(d: f32) {
+    DENSITY.store(d.clamp(0.8, 1.2).to_bits(), Ordering::Relaxed);
+}
+
+pub fn density() -> f32 {
+    f32::from_bits(DENSITY.load(Ordering::Relaxed))
 }
 
 pub fn set_radius_scale(s: f32) {
@@ -69,116 +79,80 @@ pub fn brand() -> Color32 {
     rgb(0xff7a00)
 }
 
-/// Spotify's mark - a filled disc with three sound waves - drawn in Rustify's
-/// orange. `wave` is normally white, as on the original.
-pub fn logo(p: &Painter, center: Pos2, radius: f32, circle: Color32, wave: Color32) {
+/// The Rustify mark: a black gear on an orange disc. The gear is deliberately
+/// generic - no sound waves, no Spotify silhouette - so the brand cannot be
+/// mistaken for anyone else's mark.
+pub fn logo(p: &Painter, center: Pos2, radius: f32, circle: Color32) {
     p.circle_filled(center, radius, circle);
-    // Each wave is an arc: a chord `half` wide whose ends fall `sag` below its
-    // apex. Those four numbers are the whole shape, as fractions of `radius`:
-    // widest and highest on top, narrowest on the bottom, evenly spaced.
-    const WAVES: [(f32, f32, f32, f32); 3] = [
-        // (apex, half width, sagitta, stroke width)
-        (-0.36, 0.64, 0.20, 0.140),
-        (-0.07, 0.52, 0.18, 0.140),
-        (0.22, 0.40, 0.15, 0.140),
-    ];
-    for (apex, half, sag, width) in WAVES {
-        let w = half * radius;
-        let s = sag * radius;
-        // Circle through the apex and both ends of the chord.
-        let arc = (w * w + s * s) / (2.0 * s);
-        let reach = (w / arc).asin();
-        let origin = Pos2::new(center.x, center.y + apex * radius + arc);
-        let steps = 20;
-        let pts: Vec<Pos2> = (0..=steps)
-            .map(|k| {
-                let t = -reach + 2.0 * reach * (k as f32 / steps as f32);
-                Pos2::new(origin.x + arc * t.sin(), origin.y - arc * t.cos())
-            })
-            .collect();
-        p.add(Shape::line(pts, Stroke::new(width * radius, wave)));
-    }
+    gear(p, center, radius, Color32::BLACK, circle);
 }
 
-/// The same orange disc and three waves `logo` paints, rasterized for the
-/// window and taskbar. Drawn at 4x and averaged down, which gives the disc
-/// and the strokes smooth edges without shipping an image or a new crate.
+/// Eight teeth around a solid body, with the disc colour showing through the
+/// hub. Shared by the on-screen marks and the rasterized app icon.
+fn gear(p: &Painter, center: Pos2, radius: f32, ink: Color32, hole: Color32) {
+    const TEETH: usize = 8;
+    let body = radius * 0.72;
+    let hub = radius * 0.28;
+    for i in 0..TEETH {
+        let angle = i as f32 / TEETH as f32 * std::f32::consts::TAU;
+        let at = |offset: f32, distance: f32| {
+            center + Vec2::new((angle + offset).cos(), (angle + offset).sin()) * distance
+        };
+        p.add(Shape::convex_polygon(
+            vec![
+                at(-0.20, body),
+                at(0.20, body),
+                at(0.15, radius),
+                at(-0.15, radius),
+            ],
+            ink,
+            Stroke::NONE,
+        ));
+    }
+    p.circle_filled(center, body, ink);
+    p.circle_filled(center, hub, hole);
+}
+
+/// The same gear rasterized for the window and taskbar. Drawn at 4x and
+/// averaged down, so the teeth stay smooth without shipping an image.
 pub fn icon(size: u32) -> eframe::egui::IconData {
     const SS: u32 = 4;
     let px = (size * SS).max(1);
     let mut hi = vec![0u8; (px * px * 4) as usize];
     let c = px as f32 / 2.0;
     let radius = c * 0.94;
-    let brand = brand();
+    let orange = brand();
+    let tau = std::f32::consts::TAU;
 
-    fn put(hi: &mut [u8], px: u32, x: u32, y: u32, color: (u8, u8, u8)) {
-        let i = ((y * px + x) * 4) as usize;
-        hi[i] = color.0;
-        hi[i + 1] = color.1;
-        hi[i + 2] = color.2;
-        hi[i + 3] = 255;
-    }
-
-    // Filled orange disc.
     for y in 0..px {
         for x in 0..px {
-            let dx = x as f32 + 0.5 - c;
-            let dy = y as f32 + 0.5 - c;
-            if dx * dx + dy * dy <= radius * radius {
-                put(&mut hi, px, x, y, (brand.r(), brand.g(), brand.b()));
+            let dx = (x as f32 + 0.5 - c) / radius;
+            let dy = (y as f32 + 0.5 - c) / radius;
+            let rr = dx * dx + dy * dy;
+            if rr > 1.0 {
+                continue;
             }
+            let r = rr.sqrt();
+            let sector = (dy.atan2(dx) + std::f32::consts::PI) / tau * 8.0;
+            let frac = sector - sector.floor();
+            let high = ((r - 0.66) / 0.34).clamp(0.0, 1.0);
+            let half = 0.20 + (0.15 - 0.20) * high;
+            let tooth = r >= 0.66 && (frac - 0.5).abs() <= half;
+            let color = if r <= 0.28 {
+                (orange.r(), orange.g(), orange.b())
+            } else if r <= 0.72 || tooth {
+                (0, 0, 0)
+            } else {
+                (orange.r(), orange.g(), orange.b())
+            };
+            let i = ((y * px + x) * 4) as usize;
+            hi[i] = color.0;
+            hi[i + 1] = color.1;
+            hi[i + 2] = color.2;
+            hi[i + 3] = 255;
         }
     }
 
-    // Three white sound waves, with the exact geometry `logo` uses.
-    const WAVES: [(f32, f32, f32, f32); 3] = [
-        // (apex, half width, sagitta, stroke width)
-        (-0.36, 0.64, 0.20, 0.140),
-        (-0.07, 0.52, 0.18, 0.140),
-        (0.22, 0.40, 0.15, 0.140),
-    ];
-    for (apex, half, sag, width) in WAVES {
-        let w = half * radius;
-        let s = sag * radius;
-        let arc = (w * w + s * s) / (2.0 * s);
-        let reach = (w / arc).asin();
-        let origin = (c, c + apex * radius + arc);
-        let steps = 72;
-        let pts: Vec<(f32, f32)> = (0..=steps)
-            .map(|k| {
-                let t = -reach + 2.0 * reach * (k as f32 / steps as f32);
-                (origin.0 + arc * t.sin(), origin.1 - arc * t.cos())
-            })
-            .collect();
-        let half_stroke = (width * radius * 0.5).max(0.75);
-        for pair in pts.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            let min_x = (a.0.min(b.0) - half_stroke).floor().max(0.0) as u32;
-            let max_x = (a.0.max(b.0) + half_stroke).ceil().min(px as f32) as u32;
-            let min_y = (a.1.min(b.1) - half_stroke).floor().max(0.0) as u32;
-            let max_y = (a.1.max(b.1) + half_stroke).ceil().min(px as f32) as u32;
-            for y in min_y..max_y {
-                for x in min_x..max_x {
-                    let p = (x as f32 + 0.5, y as f32 + 0.5);
-                    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-                    let len2 = dx * dx + dy * dy;
-                    let t = if len2 > 0.0 {
-                        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let ddx = p.0 - (a.0 + t * dx);
-                    let ddy = p.1 - (a.1 + t * dy);
-                    if ddx * ddx + ddy * ddy <= half_stroke * half_stroke {
-                        put(&mut hi, px, x, y, (255, 255, 255));
-                    }
-                }
-            }
-        }
-    }
-
-    // Average the supersampled pixels down to the requested size, weighting
-    // colour by coverage so transparent corners do not darken the rim.
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let cell = SS * SS;
     for y in 0..size {
@@ -254,6 +228,9 @@ pub struct Custom {
     pub blur: f32,
     /// 0 = photo at full strength, 1 = almost black.
     pub dim: f32,
+    /// How much of the two-colour gradient is laid over the photo. 0 leaves the
+    /// photo untouched, 1 gives it the full themed wash.
+    pub wash: f32,
 }
 
 impl Default for Custom {
@@ -266,6 +243,7 @@ impl Default for Custom {
             image: String::new(),
             blur: 0.55,
             dim: 0.45,
+            wash: 0.55,
         }
     }
 }
@@ -603,6 +581,61 @@ pub fn shuffle_icon(p: &Painter, rect: Rect, color: Color32) {
             c + Vec2::new(s, s * 0.55),
             c + Vec2::new(s * 0.6, s * 0.55 + 3.0),
         ],
+        st,
+    ));
+}
+
+/// Pencil glyph for the player bar's "Edit album" button.
+pub fn edit_icon(p: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let st = Stroke::new(1.5_f32, color);
+    p.add(Shape::line(
+        vec![c + Vec2::new(-5.0, 5.0), c + Vec2::new(4.5, -4.5)],
+        st,
+    ));
+    p.add(Shape::line(
+        vec![
+            c + Vec2::new(-6.5, 6.5),
+            c + Vec2::new(-5.0, 5.0),
+            c + Vec2::new(-6.5, 4.5),
+        ],
+        st,
+    ));
+    p.add(Shape::line(
+        vec![c + Vec2::new(3.0, -5.5), c + Vec2::new(5.5, -3.0)],
+        st,
+    ));
+}
+
+/// A small cross, used to take one row out of a playlist.
+pub fn close_icon(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let st = Stroke::new(1.6_f32, color);
+    p.add(Shape::line_segment(
+        [c + Vec2::new(-size, -size), c + Vec2::new(size, size)],
+        st,
+    ));
+    p.add(Shape::line_segment(
+        [c + Vec2::new(size, -size), c + Vec2::new(-size, size)],
+        st,
+    ));
+}
+
+/// Lines plus a plus: "add this song to a playlist".
+pub fn playlist_add_icon(p: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let st = Stroke::new(1.5_f32, color);
+    for (dy, len) in [(-5.0_f32, 7.0_f32), (0.0, 9.0), (5.0, 6.0)] {
+        p.add(Shape::line_segment(
+            [c + Vec2::new(-9.0, dy), c + Vec2::new(-9.0 + len, dy)],
+            st,
+        ));
+    }
+    p.add(Shape::line_segment(
+        [c + Vec2::new(5.0, -5.0), c + Vec2::new(5.0, 5.0)],
+        st,
+    ));
+    p.add(Shape::line_segment(
+        [c, c + Vec2::new(10.0, 0.0)],
         st,
     ));
 }

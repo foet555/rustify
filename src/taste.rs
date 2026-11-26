@@ -265,11 +265,19 @@ fn add_genres(found: &mut Vec<&'static str>, genres: &[&'static str]) {
 /// matches first, then artist/title hints, and only "mix" when nothing at all
 /// is known about its tracks.
 pub fn assign_imported_genres(lib: &mut [Collection]) {
+    // The demo catalogue no longer appears in the launch library, but its
+    // artist and genre tags are still the best local reference for imported
+    // rows, so they stay as a hidden lookup rather than visible collections.
+    let reference = crate::library::sample();
+    assign_imported_genres_with(lib, &reference);
+}
+
+pub fn assign_imported_genres_with(lib: &mut [Collection], reference: &[Collection]) {
     use std::collections::BTreeMap;
     const MAX_GENRES: usize = 3;
     let mut by_key: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
     let mut by_artist: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
-    for c in lib
+    for c in reference
         .iter()
         .filter(|c| !c.imported() && c.genres.iter().any(|g| *g != "mix"))
     {
@@ -601,11 +609,11 @@ mod tests {
         assign_imported_genres(&mut lib);
 
         let mut p = Profile::default();
-        p.record_play("Queen", "Queen|Bohemian Rhapsody", &["rock".to_string()]);
+        p.record_play("Kavinsky", "Kavinsky|Nightcall", &["synthwave".to_string()]);
 
         let s = TasteSnapshot::build(&p, &lib);
         assert_eq!(s.plays, 1);
-        assert_eq!(s.played_genres[0].0, "rock");
+        assert_eq!(s.played_genres[0].0, "synthwave");
         assert_eq!(
             s.imported_genres
                 .iter()
@@ -613,7 +621,7 @@ mod tests {
                 .map(|(_, n)| *n),
             Some(2)
         );
-        assert!(s.genres.iter().any(|(g, _)| g == "rock"));
+        assert!(s.genres.iter().any(|(g, _)| g == "synthwave"));
         assert!(s.genre_weight("electronic") >= 2);
         assert_eq!(
             s.imported_artists
@@ -630,7 +638,7 @@ mod tests {
         let m = mix(&s, &lib, 0);
         assert!(!m.tracks.is_empty());
         assert!(m.subtitle.contains(&s.artists[0].0));
-        assert!(m.subtitle.contains("leaning rock"));
+        assert!(m.subtitle.contains("leaning synthwave"));
         assert_eq!(recommended(&s, &lib).len(), lib.len());
         assert_eq!(s.personality(), personality_for(s.top_genre()));
 
@@ -651,13 +659,12 @@ mod tests {
         let mut p = Profile::default();
         p.theme = 2;
         p.volume = 0.42;
-        play(&mut p, &lib, 3, 0, 3); // synthwave / Nova Kite
-        play(&mut p, &lib, 3, 1, 2); // synthwave / Aster Drive
-        play(&mut p, &lib, 4, 0, 2); // lofi / Low Ceiling
-        play(&mut p, &lib, 8, 0, 1); // folk / The Ferns
-        play(&mut p, &lib, 2, 3, 1); // chill / Vela Grey
-        p.liked.insert(lib[3].tracks[0].key());
-        p.liked.insert(lib[4].tracks[1].key());
+        play(&mut p, &lib, 1, 0, 3); // synthwave / Kavinsky
+        play(&mut p, &lib, 1, 1, 2); // synthwave / College, Electric Youth
+        play(&mut p, &lib, 2, 0, 2); // electronic / Daft Punk
+        play(&mut p, &lib, 3, 0, 1); // hiphop / Kendrick Lamar
+        p.liked.insert(lib[1].tracks[0].key());
+        p.liked.insert(lib[2].tracks[1].key());
 
         let path = temp_path("roundtrip");
         p.save_to(&path);
@@ -698,65 +705,64 @@ mod tests {
     fn recorded_plays_change_rankings_personality_and_mixes() {
         let lib = library::sample();
 
-        let mut rock = Profile::default();
-        play(&mut rock, &lib, 3, 0, 4); // Rock Classics: Bohemian Rhapsody, Queen
+        let mut synth = Profile::default();
+        play(&mut synth, &lib, 1, 0, 4); // deltsbangers: Nightcall, Kavinsky
 
-        let mut lofi = Profile::default();
-        play(&mut lofi, &lib, 4, 0, 4); // Lo-Fi & Chill: Feather, Nujabes
+        let mut rap = Profile::default();
+        play(&mut rap, &lib, 3, 0, 4); // good kid: Sherane, Kendrick Lamar
 
-        let rs = TasteSnapshot::build(&rock, &lib);
-        let ls = TasteSnapshot::build(&lofi, &lib);
+        let ss = TasteSnapshot::build(&synth, &lib);
+        let rs = TasteSnapshot::build(&rap, &lib);
 
-        assert_eq!(rs.top_genre(), Some("rock"));
-        assert_eq!(ls.top_genre(), Some("lofi"));
-        assert_ne!(rs.genres, ls.genres);
+        assert_eq!(ss.top_genre(), Some("synthwave"));
+        assert_eq!(rs.top_genre(), Some("hiphop"));
+        assert_ne!(ss.genres, rs.genres);
 
-        assert!(rs.personality().contains("Amp up"));
-        assert!(ls.personality().contains("Study companion"));
-        assert_ne!(rs.personality(), ls.personality());
+        assert!(ss.personality().contains("Neon dreamer"));
+        assert!(rs.personality().contains("Bar hunter"));
+        assert_ne!(ss.personality(), rs.personality());
 
-        assert_eq!(rs.artists[0].0, "Queen");
-        assert_eq!(ls.artists[0].0, "Nujabes, Cise Starr, Akin");
-        assert_ne!(rs.artists, ls.artists);
+        assert_eq!(ss.artists[0].0, "Kavinsky");
+        assert_eq!(rs.artists[0].0, "Kendrick Lamar");
+        assert_ne!(ss.artists, rs.artists);
 
-        let ms = mix(&rs, &lib, 0);
-        let ml = mix(&ls, &lib, 0);
-        assert_ne!(keys(&ms), keys(&ml));
-        assert_eq!(ms.tracks[0].artist, "Queen");
-        assert_eq!(ml.tracks[0].artist, "Nujabes, Cise Starr, Akin");
-        assert!(ms.subtitle.contains("Queen"));
-        assert!(ml.subtitle.contains("Nujabes"));
+        let ms = mix(&ss, &lib, 0);
+        let mr = mix(&rs, &lib, 0);
+        assert_ne!(keys(&ms), keys(&mr));
+        assert_eq!(ms.tracks[0].artist, "Kavinsky");
+        assert_eq!(mr.tracks[0].artist, "Kendrick Lamar");
+        assert!(ms.subtitle.contains("Kavinsky"));
+        assert!(mr.subtitle.contains("Kendrick Lamar"));
 
         // Recommended for you follows the same evidence.
-        let rr = recommended(&rs, &lib);
-        let rl = recommended(&ls, &lib);
-        assert_ne!(rr, rl);
-        assert!(lib[rr[0]].genres.iter().any(|g| *g == "rock"));
-        assert!(lib[rl[0]]
+        let synth_rec = recommended(&ss, &lib);
+        let rap_rec = recommended(&rs, &lib);
+        assert_ne!(synth_rec, rap_rec);
+        assert!(lib[synth_rec[0]]
             .genres
             .iter()
-            .any(|g| *g == "lofi" || *g == "chill"));
+            .any(|g| *g == "synthwave"));
+        assert!(lib[rap_rec[0]].genres.iter().any(|g| *g == "hiphop"));
     }
 
     #[test]
     fn rankings_follow_the_latest_evidence() {
         let lib = library::sample();
         let mut p = Profile::default();
-        play(&mut p, &lib, 4, 0, 2); // lofi 2
-        play(&mut p, &lib, 3, 0, 3); // rock 3
+        play(&mut p, &lib, 1, 0, 2); // synthwave 4
         let s = TasteSnapshot::build(&p, &lib);
-        assert_eq!(s.top_genre(), Some("rock"));
-        assert!(s.personality().contains("Amp up"));
+        assert_eq!(s.top_genre(), Some("synthwave"));
+        assert!(s.personality().contains("Neon dreamer"));
 
-        play(&mut p, &lib, 4, 1, 5); // now lofi 7
+        play(&mut p, &lib, 3, 0, 3); // now hiphop 6
         let s = TasteSnapshot::build(&p, &lib);
-        assert_eq!(s.top_genre(), Some("lofi"));
-        assert!(s.personality().contains("Study companion"));
-        assert_eq!(s.artists[0].0, "Nujabes");
+        assert_eq!(s.top_genre(), Some("hiphop"));
+        assert!(s.personality().contains("Bar hunter"));
+        assert_eq!(s.artists[0].0, "Kendrick Lamar");
 
         let m = mix(&s, &lib, 0);
-        assert!(m.subtitle.contains("Nujabes"));
-        assert_eq!(m.tracks[0].artist, "Nujabes");
+        assert!(m.subtitle.contains("Kendrick Lamar"));
+        assert_eq!(m.tracks[0].artist, "Kendrick Lamar");
     }
 
     #[test]
@@ -767,7 +773,7 @@ mod tests {
 
         // A liked track in a collection nobody played should still lift it.
         let before = recommended(&TasteSnapshot::build(&p, &lib), &lib);
-        let target = 7usize; // Chill Hits
+        let target = 2usize; // Random Access Memories
         for t in lib[target].tracks.iter().take(2) {
             p.liked.insert(t.key());
         }
@@ -782,7 +788,7 @@ mod tests {
         want.sort();
         assert_eq!(got, want);
         // Track-level genre lookup still attributes those likes to their real tags.
-        assert!(genres_for(&lib, &lib[target].tracks[0]).contains(&"chill".to_string()));
+        assert!(genres_for(&lib, &lib[target].tracks[0]).contains(&"electronic".to_string()));
         assert!(score(&TasteSnapshot::build(&p, &lib), &lib[target]) > 0);
     }
 }

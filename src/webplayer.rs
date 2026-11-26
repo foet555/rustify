@@ -25,9 +25,14 @@ const PAGE: &str = r#"<!doctype html>
 window.__log = m => { try { fetch('/log?m=' + encodeURIComponent(m)); } catch (e) {} };
 window.addEventListener('error', e => __log('pageerror: ' + e.message), true);
 window.addEventListener('load', () => __log('page-loaded'));
-setTimeout(() => { if (!window.__sdkReady) __log('sdk-missing'); }, 6000);
+setTimeout(() => {
+  if (!window.__sdkReady) {
+    __log('sdk-missing');
+    fetch('/error?m=the Spotify player script did not load');
+  }
+}, 6000);
 </script>
-<script src="https://sdk.scdn.co/spotify-player.js" onerror="__log('sdk-failed')"></script>
+<script src="https://sdk.scdn.co/spotify-player.js" onerror="__log('sdk-failed'); fetch('/error?m=the Spotify player script could not be fetched')"></script>
 <script>
 __log('page-script');
 async function getToken() {
@@ -48,6 +53,7 @@ window.onSpotifyWebPlaybackSDKReady = () => {
     getOAuthToken: cb => { getToken().then(cb); },
     volume: 0.7
   });
+  window.__player = player;
   player.addListener('ready', ({ device_id }) => {
     fetch('/ready?id=' + encodeURIComponent(device_id));
   });
@@ -87,6 +93,12 @@ pub enum Event {
     /// Free accounts cannot use the SDK.
     Account(String),
     Error(String),
+    /// The SDK itself started or stopped; this is faster than the Web API.
+    State {
+        paused: bool,
+        position_ms: u64,
+        duration_ms: u64,
+    },
 }
 
 #[derive(Default)]
@@ -162,6 +174,23 @@ impl Player {
             bridge.token = None;
         }
     }
+
+    /// Stops the SDK's audio from inside the page. The Web API command still
+    /// goes out, but the sound here stops in the same frame as the click.
+    pub fn pause_now(&self) {
+        let _ = self
+            ._view
+            .evaluate_script("window.__player && window.__player.pause();");
+    }
+
+    /// The matching instant resume, for when the same track is still loaded.
+    pub fn resume_now(&self) {
+        let _ = self
+            ._view
+            .evaluate_script(
+                "window.__player && window.__player.activateElement && window.__player.activateElement(); window.__player && window.__player.resume();",
+            );
+    }
 }
 
 /// Serves the page and the tiny bridge endpoints on a loopback port picked by
@@ -234,13 +263,20 @@ fn handle(mut stream: TcpStream, bridge: &Arc<Mutex<Bridge>>) {
             reply(&mut stream, "text/plain", b"ok");
         }
         "/state" => {
+            let paused = param(query, "paused") == "1";
+            let position_ms = param(query, "position").parse().unwrap_or(0);
+            let duration_ms = param(query, "duration").parse().unwrap_or(0);
             if cfg!(debug_assertions) {
                 eprintln!(
-                    "webplayer state paused={} position={} duration={}",
-                    param(query, "paused"),
-                    param(query, "position"),
-                    param(query, "duration")
+                    "webplayer state paused={paused} position={position_ms} duration={duration_ms}"
                 );
+            }
+            if let Ok(mut b) = bridge.lock() {
+                b.events.push(Event::State {
+                    paused,
+                    position_ms,
+                    duration_ms,
+                });
             }
             reply(&mut stream, "text/plain", b"ok");
         }

@@ -77,6 +77,9 @@ pub struct ImportedTrack {
     pub added: String,
     /// Album cover from the CDN, when the import could see one.
     pub art: Art,
+    /// Spotify track URI, used to remove this exact row from its playlist.
+    /// Empty for CSV imports and stores written before this column existed.
+    pub uri: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -85,6 +88,9 @@ pub struct ImportedPlaylist {
     pub tracks: Vec<ImportedTrack>,
     /// Playlist cover, when the import could see one.
     pub art: Art,
+    /// Spotify playlist id. Empty means this is a local list (CSV or hand
+    /// built), which can only be edited in Rustify.
+    pub id: String,
 }
 
 impl ImportedPlaylist {
@@ -141,19 +147,21 @@ pub fn save(path: &Path, list: &[ImportedPlaylist]) {
     let mut out = String::from("v1\n");
     for p in list {
         out.push_str(&format!(
-            "playlist\t{}\t{}\n",
+            "playlist\t{}\t{}\t{}\n",
             clean(&p.name),
-            clean(p.art.largest().unwrap_or(""))
+            clean(p.art.largest().unwrap_or("")),
+            clean(&p.id)
         ));
         for t in &p.tracks {
             out.push_str(&format!(
-                "track\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "track\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 clean(&t.title),
                 clean(&t.artist),
                 clean(&t.album),
                 t.secs,
                 clean(&t.added),
-                clean(t.art.largest().unwrap_or(""))
+                clean(t.art.largest().unwrap_or("")),
+                clean(&t.uri)
             ));
         }
     }
@@ -168,11 +176,19 @@ pub fn load(path: &Path) -> Vec<ImportedPlaylist> {
     for line in text.lines() {
         let mut parts = line.split('\t');
         match parts.next().unwrap_or("") {
-            "playlist" => out.push(ImportedPlaylist {
-                name: parts.next().unwrap_or("Untitled").to_string(),
-                tracks: Vec::new(),
-                art: Art::of(parts.next().unwrap_or("")),
-            }),
+            "playlist" => {
+                let name = parts.next().unwrap_or("Untitled").to_string();
+                let art = Art::of(parts.next().unwrap_or(""));
+                // Older stores stop after the cover; they stay local-only
+                // until the playlist is imported again from Spotify.
+                let id = parts.next().unwrap_or("").to_string();
+                out.push(ImportedPlaylist {
+                    name,
+                    tracks: Vec::new(),
+                    art,
+                    id,
+                });
+            }
             "track" => {
                 if let Some(p) = out.last_mut() {
                     let title = parts.next().unwrap_or("").to_string();
@@ -188,6 +204,7 @@ pub fn load(path: &Path) -> Vec<ImportedPlaylist> {
                         // shown as unknown rather than guessed.
                         added: parts.next().unwrap_or("").to_string(),
                         art: Art::of(parts.next().unwrap_or("")),
+                        uri: parts.next().unwrap_or("").to_string(),
                     });
                 }
             }
@@ -920,6 +937,17 @@ pub fn parse_items(json: &str) -> Result<(Vec<ImportedTrack>, Option<String>), S
                 .get("duration_ms")
                 .and_then(|d| d.as_u64())
                 .unwrap_or(0);
+            let uri = item
+                .get("uri")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(|id| format!("spotify:track:{id}"))
+                })
+                .unwrap_or_default();
             out.push(ImportedTrack {
                 title: title.to_string(),
                 artist,
@@ -928,6 +956,7 @@ pub fn parse_items(json: &str) -> Result<(Vec<ImportedTrack>, Option<String>), S
                 added: String::new(),
                 // A track wears its album's cover, exactly like the client.
                 art: item.get("album").map(art_of).unwrap_or_default(),
+                uri,
             });
         }
     }
@@ -1004,6 +1033,17 @@ pub fn parse_embed(html: &str) -> Result<ImportedPlaylist, String> {
                 .and_then(|d| d.as_u64())
                 .map(|ms| (ms / 1000).max(1) as u32)
                 .unwrap_or(0);
+            let uri = item
+                .get("uri")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(|id| format!("spotify:track:{id}"))
+                })
+                .unwrap_or_default();
             tracks.push(ImportedTrack {
                 title: replace_nbsp(title),
                 artist,
@@ -1011,13 +1051,22 @@ pub fn parse_embed(html: &str) -> Result<ImportedPlaylist, String> {
                 secs,
                 added: String::new(),
                 art: art_of(item),
+                uri,
             });
         }
     }
+    let id = entity
+        .get("uri")
+        .and_then(Value::as_str)
+        .and_then(|uri| uri.strip_prefix("spotify:playlist:"))
+        .or_else(|| entity.get("id").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
     Ok(ImportedPlaylist {
         name,
         tracks,
         art: art_of(entity),
+        id,
     })
 }
 
@@ -1042,7 +1091,12 @@ pub fn import_public_playlist(
     if !response.ok() {
         return Err(response_error(&response));
     }
-    let playlist = parse_embed(&response.body)?;
+    let mut playlist = parse_embed(&response.body)?;
+    // The link already names the playlist even when the embed page omitted
+    // its URI; keep the id so playback and removal can target it later.
+    if playlist.id.is_empty() {
+        playlist.id = id;
+    }
     log(format!(
         "Found {} ({} tracks).",
         playlist.name,
@@ -1090,6 +1144,7 @@ pub fn fetch_all_at<H: Http>(
                 art: p.art.clone(),
                 name: p.name.clone(),
                 tracks: Vec::new(),
+                id: p.id.clone(),
             });
             continue;
         }
@@ -1125,6 +1180,7 @@ pub fn fetch_all_at<H: Http>(
             art: p.art.clone(),
             name: p.name.clone(),
             tracks,
+            id: p.id.clone(),
         });
     }
     Ok(out)
@@ -1316,6 +1372,7 @@ pub fn import_csv(text: &str, name: &str) -> Result<ImportedPlaylist, String> {
                 .and_then(|i| row.get(i))
                 .map(|u| Art::of(u))
                 .unwrap_or_default(),
+            uri: String::new(),
         });
     }
     if tracks.is_empty() {
@@ -1325,6 +1382,7 @@ pub fn import_csv(text: &str, name: &str) -> Result<ImportedPlaylist, String> {
         art: Art::default(),
         name: clean(name),
         tracks,
+        id: String::new(),
     })
 }
 
@@ -1529,6 +1587,31 @@ mod tests {
     }
 
     #[test]
+    fn an_old_store_without_ids_still_loads_as_a_local_playlist() {
+        let path = std::env::temp_dir().join(format!(
+            "rustify-old-import-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(
+            &path,
+            "v1\nplaylist\tOld Trip\tcover.jpg\ntrack\tNightcall\tKavinsky\tOutRun\t258\t2026-01-01\tcover.jpg\n",
+        )
+        .unwrap();
+        let loaded = load(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Old Trip");
+        assert!(loaded[0].id.is_empty());
+        assert_eq!(loaded[0].tracks.len(), 1);
+        assert_eq!(loaded[0].tracks[0].title, "Nightcall");
+        assert!(loaded[0].tracks[0].uri.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn imported_playlists_round_trip_and_become_collections() {
         let path = std::env::temp_dir().join(format!(
             "rustify-import-{}-{}.txt",
@@ -1550,6 +1633,7 @@ mod tests {
                         album: "Neon Horizon".to_string(),
                         secs: 254,
                         added: "2026-11-22".to_string(),
+                        uri: "spotify:track:neon".to_string(),
                     },
                     ImportedTrack {
                         art: Art::default(),
@@ -1558,13 +1642,16 @@ mod tests {
                         album: "Paper Planes".to_string(),
                         secs: 245,
                         added: "2026-11-22".to_string(),
+                        uri: "spotify:track:paper".to_string(),
                     },
                 ],
+                id: "road-trip-id".to_string(),
             },
             ImportedPlaylist {
                 art: Art::default(),
                 name: "Empty".to_string(),
                 tracks: Vec::new(),
+                id: String::new(),
             },
         ];
         save(&path, &list);
@@ -1572,6 +1659,11 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].name, "Road trip");
         assert_eq!(loaded[0].tracks, list[0].tracks);
+        assert_eq!(loaded[0].id, "road-trip-id", "the playlist link was lost");
+        assert_eq!(
+            loaded[0].tracks[0].uri, "spotify:track:neon",
+            "the track link was lost"
+        );
         assert_eq!(loaded[1].name, "Empty");
         assert!(loaded[1].tracks.is_empty());
 

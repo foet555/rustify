@@ -342,6 +342,13 @@ impl Queue {
         Self::with(Arc::new(Curl), cache_dir(), true)
     }
 
+    /// A queue with an explicit cache directory. The mobile build keeps its
+    /// clips in the app's private files so Android can clean them up with the
+    /// rest of the app data.
+    pub fn with_cache(dir: PathBuf) -> Self {
+        Self::with(Arc::new(Curl), dir, true)
+    }
+
     /// Tests drive clicks without touching the network.
     #[cfg(test)]
     pub fn disabled() -> Self {

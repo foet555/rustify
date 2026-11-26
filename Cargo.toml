@@ -1,6 +1,6 @@
 [package]
 name = "spotify-rust"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -11,7 +11,23 @@ serde_json = "1"
 # so this only asks for the two formats that matter.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rodio = "0.22.2"
-# Hosts Spotify's Web Playback SDK, the only supported way to play full songs
-# without the desktop app running. Spotify decrypts and renders the audio.
+# The old hidden WebView2 player is no longer started; the native librespot
+# backend below is the only playback engine. Keep these while that module is
+# retired so the current release does not carry a half-removed player.
 wry = "0.53"
 raw-window-handle = "0.6"
+# Native audio and Web API. librespot streams Ogg Vorbis through Spotify
+# Connect; rspotify reads metadata and checks the account's product. Both use
+# rustls so Windows does not need an external TLS/audio SDK.
+librespot = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "rodio-backend"] }
+rspotify = { version = "0.16.1", default-features = false, features = ["client-reqwest", "reqwest-rustls-tls"] }
+# The backend owns its own runtime/thread so catalog fetches and audio never
+# touch the egui frame loop.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[patch.crates-io]
+# librespot 0.8.0 calls process::exit(1) when it sees a Free account. That
+# would kill the UI process before an Error event could be delivered, so the
+# local copy logs the account type and lets the backend refuse playback.
+librespot-core = { path = "vendor/librespot-core" }

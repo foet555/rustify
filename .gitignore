@@ -4,6 +4,7 @@ Thumbs.db
 .DS_Store
 
 # Local screenshots and scratch images.
+/feature-*.png
 /bar9.png
 /full9.png
 /small9.png

@@ -215,20 +215,6 @@ pub fn open_download_page() {
     open_url("https://www.spotify.com/download/windows/");
 }
 
-/// Opens the installed Spotify client through its protocol handler. The caller
-/// keeps polling the device list; nothing waits for Spotify to finish loading.
-/// Tests must not launch a real client, so the spawn is compiled out there.
-pub fn launch_spotify() {
-    #[cfg(all(windows, not(test)))]
-    {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", "spotify:"])
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .spawn();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

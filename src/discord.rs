@@ -2,13 +2,15 @@
 //
 // This only talks to the Discord client already running on this PC, over its
 // local IPC pipe. Nothing is uploaded, no track audio is touched, and the
-// payload is just "this song, this artist, this position" - the same text the
-// player bar already shows. An Application ID is required because that is how
-// Discord knows which app the card belongs to; the user creates one in the
-// Discord developer portal and names it Rustify.
+// payload is just the song, artist, album, cover, position and a search link -
+// the same information the player bar already shows. An Application ID is
+// required because that is how Discord knows which app the card belongs to;
+// the user creates one in the Discord developer portal and names it Rustify.
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
 
 pub const OP_HANDSHAKE: u32 = 0;
 pub const OP_FRAME: u32 = 1;
@@ -18,15 +20,24 @@ pub const OP_FRAME: u32 = 1;
 pub struct Now {
     pub track: String,
     pub artist: String,
+    pub album: String,
+    /// Album cover URL when one is known. Discord fetches external https art
+    /// itself; an empty value falls back to the app's icon.
+    pub image: String,
     pub playing: bool,
     pub elapsed_ms: u64,
+    pub duration_ms: u64,
 }
 
 impl Now {
     /// Presence is only re-sent when this changes, so a moving playhead does
-    /// not spam Discord twice a second.
+    /// not spam Discord twice a second. Cover and album are included because
+    /// they can arrive a moment after the first card.
     pub fn signature(&self) -> String {
-        format!("{}|{}|{}", self.track, self.artist, self.playing)
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.track, self.artist, self.album, self.image, self.playing, self.duration_ms
+        )
     }
 }
 
@@ -44,10 +55,12 @@ fn escape(s: &str) -> String {
 /// Discord truncates long strings itself, but sending 300 characters of a
 /// YouTube upload title is pointless.
 fn clip(s: &str) -> String {
-    if s.chars().count() <= 120 {
-        return s.to_string();
+    // A line break in a title must not turn the two-line card into three.
+    let flat = s.replace(['\n', '\r'], " ");
+    if flat.chars().count() <= 120 {
+        return flat;
     }
-    s.chars().take(117).collect::<String>() + "..."
+    flat.chars().take(117).collect::<String>() + "..."
 }
 
 /// `[op][len][json]`, little endian, which is what the client reads.
@@ -64,25 +77,78 @@ pub fn handshake(client_id: &str) -> String {
     format!(r#"{{"v":1,"client_id":"{}"}}"#, escape(client_id))
 }
 
+/// The card gets a real link rather than a fake "open in app" promise: the
+/// button and the cover both lead to the song on Spotify.
+fn search_url(now: &Now) -> String {
+    let mut query = now.track.trim().to_string();
+    if !now.artist.trim().is_empty() {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(now.artist.trim());
+    }
+    // Keep the encoded URL inside Discord's button limit even when a long
+    // title contains characters that expand to three bytes each.
+    let query: String = query
+        .replace(['\n', '\r'], " ")
+        .chars()
+        .take(48)
+        .collect();
+    format!(
+        "https://open.spotify.com/search/{}",
+        crate::catalog::encode_query(&query)
+    )
+}
+
 pub fn activity(now: &Now) -> String {
-    let artist = if now.artist.trim().is_empty() {
+    let artist = clip(now.artist.trim());
+    let album = clip(now.album.trim());
+    // Keep the second line useful even when a file has no album metadata.
+    let state = if artist.is_empty() && album.is_empty() {
         "Rustify".to_string()
+    } else if album.is_empty() {
+        format!("by {artist}")
+    } else if artist.is_empty() {
+        album.clone()
     } else {
-        format!("by {}", clip(&now.artist))
+        format!("by {artist} · {album}")
     };
-    let mut act = format!(
-        r#"{{"type":2,"details":"{}","state":"{}""#,
-        escape(&clip(&now.track)),
-        escape(&artist)
-    );
-    // A start timestamp makes Discord draw the real elapsed time; while paused
-    // there is no honest position to show, so it is left out.
+    let state = clip(&state);
+    let search = search_url(now);
+    let mut act = json!({
+        "type": 2,
+        "details": clip(&now.track),
+        "state": state,
+        "buttons": [{"label": "Search on Spotify", "url": &search}],
+    });
+    // A start timestamp makes Discord draw the real elapsed time; the end makes
+    // it draw the track's full length. While paused there is no honest
+    // position to show, so neither is sent.
     if now.playing {
         let start = now_ms().saturating_sub(now.elapsed_ms as i64);
-        act.push_str(&format!(r#","timestamps":{{"start":{start}}}"#));
+        let mut timestamps = json!({"start": start});
+        if now.duration_ms > now.elapsed_ms {
+            let end = start.saturating_add((now.duration_ms - now.elapsed_ms) as i64);
+            timestamps["end"] = json!(end);
+        }
+        act["timestamps"] = timestamps;
     }
-    act.push('}');
-    act
+    // A raw external URL is what Discord's RPC takes; its gateway turns it
+    // into the proxied mp: form. Unknown or http-only covers are skipped.
+    let image = now.image.trim();
+    if image.starts_with("https://") && image.chars().count() <= 313 {
+        let mut assets = json!({
+            "large_image": image,
+            "large_text": if album.is_empty() { "Rustify" } else { album.as_str() },
+        });
+        // The cover link is optional and has a tighter length limit than the
+        // button, so omit it rather than send a field Discord rejects.
+        if search.len() <= 256 {
+            assets["large_url"] = json!(&search);
+        }
+        act["assets"] = assets;
+    }
+    act.to_string()
 }
 
 pub fn set_activity(now: &Now, nonce: &str) -> String {
@@ -211,8 +277,11 @@ mod tests {
         Now {
             track: track.to_string(),
             artist: artist.to_string(),
+            album: String::new(),
+            image: String::new(),
             playing,
             elapsed_ms: 0,
+            duration_ms: 0,
         }
     }
 
@@ -245,6 +314,48 @@ mod tests {
         assert!(v["args"]["activity"]["timestamps"]["start"].is_i64());
         assert_eq!(v["args"]["pid"], std::process::id());
         assert_eq!(v["nonce"], "n1");
+    }
+
+    #[test]
+    fn rich_card_includes_cover_album_progress_and_a_spotify_button() {
+        let rich = Now {
+            track: "Nightcall".to_string(),
+            artist: "Kavinsky".to_string(),
+            album: "OutRun".to_string(),
+            image: "https://i.scdn.co/image/abc".to_string(),
+            playing: true,
+            elapsed_ms: 30_000,
+            duration_ms: 258_000,
+        };
+        let v: serde_json::Value = serde_json::from_str(&activity(&rich)).unwrap();
+        assert_eq!(v["state"], "by Kavinsky · OutRun");
+        assert_eq!(v["assets"]["large_image"], "https://i.scdn.co/image/abc");
+        assert_eq!(v["assets"]["large_text"], "OutRun");
+        assert_eq!(
+            v["assets"]["large_url"],
+            "https://open.spotify.com/search/Nightcall+Kavinsky"
+        );
+        assert_eq!(v["buttons"][0]["label"], "Search on Spotify");
+        assert_eq!(
+            v["buttons"][0]["url"],
+            "https://open.spotify.com/search/Nightcall+Kavinsky"
+        );
+        let start = v["timestamps"]["start"].as_i64().unwrap();
+        let end = v["timestamps"]["end"].as_i64().unwrap();
+        assert_eq!(end - start, 228_000);
+    }
+
+    #[test]
+    fn a_card_without_art_still_has_the_search_button() {
+        let v: serde_json::Value = serde_json::from_str(&activity(&now(
+            "Sunset",
+            "The Midnight",
+            false,
+        )))
+        .unwrap();
+        assert!(v.get("assets").is_none());
+        assert_eq!(v["buttons"][0]["label"], "Search on Spotify");
+        assert!(v.get("timestamps").is_none());
     }
 
     #[test]
