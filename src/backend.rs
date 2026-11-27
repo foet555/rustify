@@ -13,6 +13,7 @@
 // text. Full playback is Premium-only: a Free account gets a clear Error event
 // before librespot ever tries to fetch audio.
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -20,9 +21,10 @@ use librespot::connect::{ConnectConfig, LoadRequest, LoadRequestOptions, Spirc};
 use librespot::core::authentication::Credentials;
 use librespot::core::config::SessionConfig;
 use librespot::core::session::Session as LibrespotSession;
+use librespot::core::spotify_uri::SpotifyUri;
 use librespot::playback::audio_backend;
 use librespot::playback::config::{AudioFormat, PlayerConfig};
-use librespot::playback::mixer::{self, MixerConfig};
+use librespot::playback::mixer::{self, Mixer, MixerConfig};
 use librespot::playback::player::{Player, PlayerEvent as LibrespotEvent};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::idtypes::{Id, TrackId};
@@ -51,6 +53,10 @@ pub struct User {
     pub display_name: String,
     /// "premium", "free" or "unknown" when Spotify omits the deprecated field.
     pub product: String,
+    /// True when the native engine registered as a Spotify Connect device.
+    /// Access-token sessions cannot use Connect, so they stream directly
+    /// through librespot instead of failing playback.
+    pub connect_device: bool,
 }
 
 /// Everything the UI needs to draw the current track without another API call.
@@ -169,6 +175,8 @@ async fn worker(mut commands: mpsc::Receiver<PlayerCommand>, events: mpsc::Sende
         events,
         spirc: None,
         spotify: None,
+        player: None,
+        mixer: None,
     };
     while let Some(command) = commands.recv().await {
         if let Err(error) = worker.handle(command).await {
@@ -184,6 +192,10 @@ struct Worker {
     events: mpsc::Sender<PlayerEvent>,
     spirc: Option<Spirc>,
     spotify: Option<AuthCodeSpotify>,
+    /// Set when Connect registration is unavailable. The librespot player can
+    /// still decode and stream a track directly with the same session.
+    player: Option<Arc<Player>>,
+    mixer: Option<Arc<dyn Mixer>>,
 }
 
 impl Worker {
@@ -194,19 +206,54 @@ impl Worker {
                 if let Some(spirc) = self.spirc.take() {
                     let _ = spirc.shutdown();
                 }
+                if let Some(player) = self.player.take() {
+                    player.stop();
+                }
+                self.mixer = None;
                 self.spotify = None;
                 Ok(())
             }
             PlayerCommand::PlayTrack(track) => self.play_track(&track).await,
-            PlayerCommand::Pause => self.spirc()?.pause().map_err(playback_error),
-            PlayerCommand::Resume => self.spirc()?.play().map_err(playback_error),
-            PlayerCommand::Seek(position_ms) => self
-                .spirc()?
-                .set_position_ms(position_ms)
-                .map_err(playback_error),
+            PlayerCommand::Pause => {
+                if let Some(spirc) = &self.spirc {
+                    spirc.pause().map_err(playback_error)
+                } else if let Some(player) = &self.player {
+                    player.pause();
+                    Ok(())
+                } else {
+                    Err("Native playback is not ready.".to_string())
+                }
+            }
+            PlayerCommand::Resume => {
+                if let Some(spirc) = &self.spirc {
+                    spirc.play().map_err(playback_error)
+                } else if let Some(player) = &self.player {
+                    player.play();
+                    Ok(())
+                } else {
+                    Err("Native playback is not ready.".to_string())
+                }
+            }
+            PlayerCommand::Seek(position_ms) => {
+                if let Some(spirc) = &self.spirc {
+                    spirc.set_position_ms(position_ms).map_err(playback_error)
+                } else if let Some(player) = &self.player {
+                    player.seek(position_ms);
+                    Ok(())
+                } else {
+                    Err("Native playback is not ready.".to_string())
+                }
+            }
             PlayerCommand::SetVolume(volume) => {
                 let raw = (volume.min(100) as u32 * u16::MAX as u32 / 100) as u16;
-                self.spirc()?.set_volume(raw).map_err(playback_error)
+                if let Some(spirc) = &self.spirc {
+                    spirc.set_volume(raw).map_err(playback_error)
+                } else if let Some(mixer) = &self.mixer {
+                    mixer.set_volume(raw);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -256,12 +303,21 @@ impl Worker {
         }
 
         let spotify = spotify_client(&session);
-        let me = spotify.me().await.map_err(api_error)?;
+        // The Web API provides the display name and an optional product hint.
+        // It is allowed to fail here: a rate-limited profile lookup must not
+        // stop librespot from streaming. ProductInfo below is authoritative.
+        let me = match spotify.me().await {
+            Ok(me) => Some(me),
+            Err(error) => {
+                eprintln!("[backend] profile lookup failed: {}", api_error(error));
+                None
+            }
+        };
         // Spotify removed `product` from the Web API in 2026. When it is present
         // it is authoritative; when it is absent the ProductInfo account type
         // is checked before any player is created.
         #[allow(deprecated)]
-        let product = me.product.clone();
+        let product = me.as_ref().and_then(|me| me.product.clone());
         if matches!(product, Some(SubscriptionLevel::Free)) {
             return Err(PREMIUM_REQUIRED.to_string());
         }
@@ -270,8 +326,14 @@ impl Worker {
             Some(SubscriptionLevel::Free) => "free",
             _ => "unknown",
         };
-        let user_id = me.id.id().to_string();
-        let display_name = me.display_name.clone().unwrap_or_else(|| user_id.clone());
+        let user_id = me
+            .as_ref()
+            .map(|me| me.id.id().to_string())
+            .unwrap_or_else(|| "spotify".to_string());
+        let display_name = me
+            .as_ref()
+            .and_then(|me| me.display_name.clone())
+            .unwrap_or_else(|| user_id.clone());
 
         let credentials = Credentials::with_access_token(session.tokens.access.clone());
         let librespot_session = LibrespotSession::new(SessionConfig::default(), None);
@@ -339,8 +401,9 @@ impl Worker {
         .map_err(playback_error)?;
         tokio::spawn(task);
         spirc.activate().map_err(playback_error)?;
-
         self.spirc = Some(spirc);
+        self.player = None;
+        self.mixer = None;
         self.spotify = Some(spotify);
         let _ = self
             .events
@@ -348,6 +411,7 @@ impl Worker {
                 id: user_id,
                 display_name,
                 product: product.to_string(),
+                connect_device: true,
             }))
             .await;
         Ok(())
@@ -357,20 +421,32 @@ impl Worker {
         let id = track_id(input)
             .ok_or_else(|| "Expected a Spotify track URI, URL, or 22-character id.".to_string())?;
         let uri = format!("spotify:track:{id}");
-        let metadata = self.metadata(&id, &uri).await?;
+        // Metadata is a nicety, not a precondition: a rate-limited Web API
+        // must not stop the native engine from streaming a known track URI.
+        let metadata = self.metadata(&id, &uri).await.ok();
 
-        let request = LoadRequest::from_tracks(
-            vec![uri],
-            LoadRequestOptions {
-                start_playing: true,
-                ..Default::default()
-            },
-        );
-        self.spirc()?.load(request).map_err(playback_error)?;
-        let _ = self
-            .events
-            .send(PlayerEvent::TrackChanged(metadata))
-            .await;
+        if let Some(spirc) = &self.spirc {
+            let request = LoadRequest::from_tracks(
+                vec![uri],
+                LoadRequestOptions {
+                    start_playing: true,
+                    ..Default::default()
+                },
+            );
+            spirc.load(request).map_err(playback_error)?;
+        } else if let Some(player) = &self.player {
+            let target = SpotifyUri::from_uri(&uri)
+                .map_err(|error| format!("Invalid Spotify track URI: {error}"))?;
+            player.load(target, true, 0);
+        } else {
+            return Err("Native playback is not ready.".to_string());
+        }
+        if let Some(metadata) = metadata {
+            let _ = self
+                .events
+                .send(PlayerEvent::TrackChanged(metadata))
+                .await;
+        }
         Ok(())
     }
 
@@ -487,6 +563,7 @@ async fn browser_login(client_id: String) -> Result<connect::Session, String> {
         client_id,
         endpoints: Endpoints::default(),
         tokens,
+        scope_rev: connect::SCOPE_REV,
     })
 }
 
@@ -530,4 +607,99 @@ fn playback_error(error: impl std::fmt::Display) -> String {
 fn premium_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("premium") || message.contains("premiumrequired")
+}
+
+/// Headless check of the primary engine: refresh the sealed session, open a
+/// librespot session with its access token, prove the account is Premium, and
+/// make sure a mixer and audio backend can be created. Nothing is registered as
+/// a Connect device and no audio is played, so it is safe to run beside the app.
+/// It returns the exact error the UI would have received.
+pub fn native_smoke() -> Result<String, String> {
+    let profile = Profile::load_from(&Profile::default_path());
+    let mut session = connect::load(&connect::default_path(), &profile.client_id)
+        .ok_or_else(|| "no saved Spotify session".to_string())?;
+    if connect::ensure_fresh(&Curl, &mut session)? && !connect::save(&connect::default_path(), &session)
+    {
+        return Err("the refreshed session could not be sealed".to_string());
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start the audio runtime: {error}"))?;
+    runtime.block_on(async move {
+        let mut out = String::new();
+        // The Web API is used for names and search, never for the stream
+        // itself. Report its state separately so a 429 here is not mistaken
+        // for a broken native engine.
+        let web = spotify_client(&session);
+        match web.me().await {
+            Ok(me) => {
+                out.push_str(&format!(
+                    "me=ok id={} product={:?}\n",
+                    me.id.id(),
+                    me.product
+                ));
+            }
+            Err(error) => out.push_str(&format!("me_error={}\n", api_error(error))),
+        }
+        let credentials = Credentials::with_access_token(session.tokens.access.clone());
+        let librespot_session = LibrespotSession::new(SessionConfig::default(), None);
+        librespot_session
+            .connect(credentials, false)
+            .await
+            .map_err(playback_error)?;
+        verify_account_type(&librespot_session).await?;
+        let mixer_factory = mixer::find(None)
+            .ok_or_else(|| "no Spotify audio mixer is available in this build".to_string())?;
+        mixer_factory(MixerConfig::default()).map_err(playback_error)?;
+        let sink_builder = audio_backend::find(None)
+            .ok_or_else(|| "no Spotify audio output is available in this build".to_string())?;
+        let _sink = sink_builder(None, AudioFormat::default());
+        out.push_str(&format!(
+            "native=ok account=premium device={DEVICE_NAME} scopes_streaming=true\n"
+        ));
+        Ok(out)
+    })
+}
+
+/// The optional third engine: a spotifyd daemon on this machine registers
+/// itself as a Spotify Connect device, so Rustify can hand playback to it with
+/// the same Web API calls it uses for any other Spotify client. Nothing is
+/// bundled or downloaded; if spotifyd is not installed the chain simply moves
+/// on to rspotify. The lookup runs once per process.
+pub fn spotifyd_path() -> Option<&'static std::path::PathBuf> {
+    use std::sync::OnceLock;
+    static FOUND: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let exe = if cfg!(windows) {
+                "spotifyd.exe"
+            } else {
+                "spotifyd"
+            };
+            let mut candidates = Vec::new();
+            if let Ok(current) = std::env::current_exe() {
+                if let Some(dir) = current.parent() {
+                    candidates.push(dir.join(exe));
+                }
+            }
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                let base = std::path::PathBuf::from(local);
+                candidates.push(base.join("Microsoft/WinGet/Links").join(exe));
+                candidates.push(base.join("Programs/spotifyd").join(exe));
+            }
+            if let Ok(home) = std::env::var("USERPROFILE") {
+                candidates.push(
+                    std::path::PathBuf::from(home)
+                        .join(".cargo/bin")
+                        .join(exe),
+                );
+            }
+            if let Some(paths) = std::env::var_os("PATH") {
+                candidates.extend(std::env::split_paths(&paths).map(|dir| dir.join(exe)));
+            }
+            candidates.into_iter().find(|path| path.is_file())
+        })
+        .as_ref()
 }

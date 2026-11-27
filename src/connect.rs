@@ -19,10 +19,11 @@ use crate::spotify::{self, Curl, Endpoints, HttpResponse, Options};
 pub const SCOPES: &str =
     "streaming user-read-email user-read-private user-read-playback-state user-modify-playback-state playlist-modify-public playlist-modify-private";
 
-/// Bumped whenever SCOPES grows. A saved session from before the change is
-/// dropped so the owner is asked to sign in again, instead of the backend
-/// failing later on a token that was never allowed to stream or edit playlists.
-const SCOPE_REV: u32 = 3;
+/// Bumped whenever SCOPES grows. A saved session keeps the revision it was
+/// granted with, so an older sign-in still controls playback instead of being
+/// thrown away and leaving every row on a 30-second preview. Features added by
+/// a later revision (native streaming, playlist editing) ask for one reconnect.
+pub const SCOPE_REV: u32 = 3;
 
 /// Anything the module needs from the network, so tests can answer without a
 /// socket and the app can use curl.exe.
@@ -77,10 +78,18 @@ pub struct Tokens {
     pub access: String,
     pub refresh: String,
     pub expires_at_ms: i64,
+    /// Space-separated scopes Spotify reported for this token. Empty for a
+    /// session saved before scopes were recorded, in which case the revision
+    /// marker is used as the best available hint.
+    pub scopes: String,
 }
 
 impl Tokens {
-    fn from_response(v: &Value, previous_refresh: &str) -> Result<Self, String> {
+    fn from_response(
+        v: &Value,
+        previous_refresh: &str,
+        previous_scopes: &str,
+    ) -> Result<Self, String> {
         let access = v
             .get("access_token")
             .and_then(|t| t.as_str())
@@ -99,10 +108,20 @@ impl Tokens {
             .and_then(Value::as_u64)
             .unwrap_or(3600)
             .max(60);
+        // A refresh response normally repeats the granted scopes. When it does
+        // not, keeping the previous list is the only honest answer: it is the
+        // scopes the refresh token actually holds.
+        let scopes = v
+            .get("scope")
+            .and_then(Value::as_str)
+            .filter(|scopes| !scopes.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| previous_scopes.to_string());
         Ok(Self {
             access,
             refresh,
             expires_at_ms: now_ms() + (secs as i64 - 30) * 1000,
+            scopes,
         })
     }
 
@@ -116,6 +135,54 @@ pub struct Session {
     pub client_id: String,
     pub endpoints: Endpoints,
     pub tokens: Tokens,
+    /// Scope revision this token was actually granted with. Rev 2 can control
+    /// Spotify's own clients; rev 3 adds native streaming and playlist edits.
+    pub scope_rev: u32,
+}
+
+impl Session {
+    fn has_scope(&self, wanted: &str) -> bool {
+        self.tokens
+            .scopes
+            .split_whitespace()
+            .any(|scope| scope == wanted)
+    }
+
+    /// In-app full songs through librespot need the `streaming` scope, added
+    /// in rev 3. When Spotify has told us the real scope list, believe it over
+    /// the revision marker; an old build used to rewrite that marker on refresh.
+    pub fn can_stream(&self) -> bool {
+        if self.tokens.scopes.trim().is_empty() {
+            self.scope_rev >= 3
+        } else {
+            self.has_scope("streaming")
+        }
+    }
+
+    /// Removing a row from a Spotify-owned playlist needs a playlist-modify
+    /// scope, also added in rev 3.
+    pub fn can_edit_playlists(&self) -> bool {
+        if self.tokens.scopes.trim().is_empty() {
+            self.scope_rev >= 3
+        } else {
+            self.has_scope("playlist-modify-public") || self.has_scope("playlist-modify-private")
+        }
+    }
+
+    /// Rev 2 already had the player scopes, which is enough to control the
+    /// owner's Spotify app through rspotify.
+    pub fn can_control_playback(&self) -> bool {
+        if self.tokens.scopes.trim().is_empty() {
+            self.scope_rev >= 2
+        } else {
+            self.has_scope("user-modify-playback-state")
+        }
+    }
+
+    /// True when a one-time reconnect adds something this session cannot do.
+    pub fn needs_reconnect(&self) -> bool {
+        !self.can_stream() || !self.can_edit_playlists()
+    }
 }
 
 /// Where a whole track stands right now, straight from Spotify.
@@ -272,7 +339,7 @@ pub fn login<T: Transport>(
         ],
     )?;
     let v: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
-    let tokens = Tokens::from_response(&v, "").map_err(|e| {
+    let tokens = Tokens::from_response(&v, "", "").map_err(|e| {
         if !is_ok(&response) {
             spotify::response_error(&response)
         } else {
@@ -314,7 +381,7 @@ pub fn refresh<T: Transport>(
         return Err(api_error(response.status, &response.body));
     }
     let v: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
-    Tokens::from_response(&v, refresh_token)
+    Tokens::from_response(&v, refresh_token, "")
 }
 
 /// Refreshes only when the access token is about to expire. Returns true when
@@ -323,12 +390,15 @@ pub fn ensure_fresh<T: Transport>(http: &T, session: &mut Session) -> Result<boo
     if !session.tokens.expired() {
         return Ok(false);
     }
-    let tokens = refresh(
+    let mut tokens = refresh(
         http,
         &session.endpoints,
         &session.client_id,
         &session.tokens.refresh,
     )?;
+    if tokens.scopes.is_empty() {
+        tokens.scopes = session.tokens.scopes.clone();
+    }
     session.tokens = tokens;
     Ok(true)
 }
@@ -569,16 +639,14 @@ fn to_json(session: &Session) -> String {
         "access_token": session.tokens.access,
         "refresh_token": session.tokens.refresh,
         "expires_at_ms": session.tokens.expires_at_ms,
-        "scope_rev": SCOPE_REV,
+        "scope_rev": session.scope_rev,
+        "scopes": session.tokens.scopes,
     })
     .to_string()
 }
 
 fn from_json(text: &str, endpoints: Endpoints, expect_client: &str) -> Option<Session> {
     let v: Value = serde_json::from_str(text).ok()?;
-    if v.get("scope_rev").and_then(Value::as_u64) != Some(SCOPE_REV as u64) {
-        return None;
-    }
     let client_id = v.get("client_id").and_then(Value::as_str)?.to_string();
     // A token minted for a different Spotify app cannot be refreshed by the
     // current Client ID, so treat it as gone rather than failing at runtime.
@@ -596,7 +664,17 @@ fn from_json(text: &str, endpoints: Endpoints, expect_client: &str) -> Option<Se
             access: v.get("access_token").and_then(Value::as_str)?.to_string(),
             refresh,
             expires_at_ms: v.get("expires_at_ms").and_then(Value::as_i64).unwrap_or(0),
+            scopes: v
+                .get("scopes")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         },
+        scope_rev: v
+            .get("scope_rev")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
     })
 }
 
@@ -974,7 +1052,9 @@ mod tests {
                 access: "old".to_string(),
                 refresh: "keep-me".to_string(),
                 expires_at_ms: 0,
+                scopes: String::new(),
             },
+            scope_rev: SCOPE_REV,
         };
         assert!(ensure_fresh(&fake, &mut session).unwrap());
         assert_eq!(session.tokens.access, "new-access");
@@ -1002,10 +1082,59 @@ mod tests {
                 access: "old".to_string(),
                 refresh: "dead".to_string(),
                 expires_at_ms: 0,
+                scopes: String::new(),
             },
+            scope_rev: SCOPE_REV,
         };
         let err = ensure_fresh(&fake, &mut session).unwrap_err();
         assert!(err.contains("HTTP 400"), "{err}");
+    }
+
+    #[test]
+    fn an_older_session_keeps_playback_control_instead_of_being_dropped() {
+        let old = serde_json::json!({
+            "client_id": "cid",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at_ms": 1,
+            "scope_rev": 2
+        })
+        .to_string();
+        let session = from_json(&old, Endpoints::default(), "cid").expect("rev 2 still loads");
+        assert!(session.can_control_playback());
+        assert!(!session.can_stream(), "rev 2 never had the streaming scope");
+        assert!(!session.can_edit_playlists());
+        assert!(session.needs_reconnect());
+
+        let current = serde_json::json!({
+            "client_id": "cid",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at_ms": 1,
+            "scope_rev": 3
+        })
+        .to_string();
+        let session = from_json(&current, Endpoints::default(), "cid").expect("rev 3 loads");
+        assert!(session.can_stream());
+        assert!(session.can_edit_playlists());
+        assert!(!session.needs_reconnect());
+
+        // An old build rewrote the revision marker on every token refresh even
+        // though the refresh token kept its original scopes. When Spotify tells
+        // us the real scope list, it wins over that marker.
+        let lying = serde_json::json!({
+            "client_id": "cid",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at_ms": 1,
+            "scope_rev": 3,
+            "scopes": "user-read-playback-state user-modify-playback-state"
+        })
+        .to_string();
+        let session = from_json(&lying, Endpoints::default(), "cid").expect("session loads");
+        assert!(session.can_control_playback());
+        assert!(!session.can_stream(), "no streaming scope means no librespot");
+        assert!(!session.can_edit_playlists());
     }
 
     #[cfg(windows)]
@@ -1019,7 +1148,9 @@ mod tests {
                 access: "access-secret".to_string(),
                 refresh: "refresh-secret".to_string(),
                 expires_at_ms: 1234,
+                scopes: String::new(),
             },
+            scope_rev: SCOPE_REV,
         };
         assert!(save(&path, &session), "DPAPI should be available");
         let raw = std::fs::read(&path).unwrap();

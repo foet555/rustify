@@ -89,9 +89,26 @@ once and paste its Client ID into Rustify. There is no client secret involved; P
 6. Click **Connect playback control**. Your browser opens Spotify's consent page; approve the
    streaming, playback and playlist-edit scopes and the tab will report "Rustify is connected".
 
-The playlist-edit scopes are new in 1.2.0. A session saved by an older build asked for fewer
-scopes, so Rustify drops it and asks you to connect once more. That is expected after this
-upgrade and only has to be done once.
+The streaming and playlist-edit scopes are newer than the first saved sessions. Rustify keeps an
+older session for playback control, so your Spotify app still plays full songs, but it asks for
+one reconnect to unlock in-app streaming and playlist editing. That is expected once and the
+Client ID is already filled in.
+
+### Playback engines
+
+Rustify tries three engines in order, so a missing one never drops a song to a preview:
+
+1. **librespot** — the built-in native player. When the Spotify sign-in can register a Connect
+   device, full songs stream inside Rustify as **Rustify (native)**. Spotify does not allow every
+   OAuth token to use Connect (keymaster), so this step can be unavailable without breaking the app.
+2. **spotifyd** — if a spotifyd daemon is installed and running on this PC, Rustify hands playback
+   to its Connect device instead. Nothing is downloaded or bundled.
+3. **rspotify (Spotify app)** — otherwise the Web API controls whichever Spotify client is awake
+   on the account. Rustify opens the desktop app when it needs a device. This is the engine used
+   when librespot cannot register a device; the banner offers **Open Spotify**.
+
+Only when none of the three is available does a row play the official 30-second preview. The
+line under the player-bar title names the engine that is actually playing.
 
 If you ever see `redirect_uri: Not matching configuration`, the URI from step 2 is missing from
 that app's Redirect URIs (or was added but not saved). Fix it in the dashboard and connect again.

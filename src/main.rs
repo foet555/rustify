@@ -191,6 +191,30 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    if args.iter().any(|a| a == "--backends-report") {
+        print!("{}", backends_report());
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--native-smoke") {
+        match backend::native_smoke() {
+            Ok(report) => print!("{report}"),
+            Err(error) => {
+                eprintln!("native smoke failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--engine-smoke") {
+        match engine_smoke() {
+            Ok(report) => print!("{report}"),
+            Err(error) => {
+                eprintln!("engine smoke failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--feature-report") {
         match feature_report() {
             Ok(report) => print!("{report}"),
@@ -391,6 +415,17 @@ struct App {
     locked_frames: u32,
     player_frames: u32,
     connect: Option<connect::Session>,
+    /// True once librespot reported an error. The Web API fallback takes over
+    /// for the rest of the run instead of retrying a dead native engine.
+    native_failed: bool,
+    /// True once librespot registered its Connect device. Playback commands
+    /// can use the active native device even before the Web API device list
+    /// answers, and a rate-limited profile lookup no longer hides the engine.
+    native_ready: bool,
+    /// True when the native engine streams tracks directly because this
+    /// OAuth session cannot register a Connect device. Clicks then go to
+    /// librespot instead of the Web API.
+    native_direct: bool,
     /// Isolated tokio worker for librespot playback and rspotify metadata.
     backend: backend::Backend,
     connect_playback: Option<connect::Playback>,
@@ -585,6 +620,20 @@ fn premium_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("premium")
 }
 
+/// Opens the installed Spotify app for the rspotify fallback. In that mode
+/// Rustify is the remote control, so the app has to be awake to offer a device
+/// to play on. Native librespot never calls this.
+fn open_spotify_app() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", "spotify:"])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+}
+
 impl App {
     fn with_gate(cc: &eframe::CreationContext<'_>, gate: gate::Presence) -> Self {
         let mut app = Self::launch_state(gate);
@@ -773,6 +822,9 @@ impl App {
             web_error: None,
             web_device: None,
             native_device: None,
+            native_failed: false,
+            native_ready: false,
+            native_direct: false,
             picked_device: None,
             web_token_asked: None,
             web_token_at: None,
@@ -896,6 +948,9 @@ impl App {
             web_error: None,
             web_device: None,
             native_device: None,
+            native_failed: false,
+            native_ready: false,
+            native_direct: false,
             picked_device: None,
             web_token_asked: None,
             web_token_at: None,
@@ -1220,6 +1275,25 @@ impl App {
     /// A linked playlist with no live session says why instead of deleting a
     /// row only on this PC. Local lists (CSV or hand-built) still edit in place.
     fn remove_playlist_track_from_ui(&mut self, imported_i: usize, track_i: usize) {
+        // A Spotify-owned row needs the playlist-modify scopes. Saying that
+        // before the request is better than a raw 403 after it.
+        let spotify_owned = self
+            .imported
+            .get(imported_i)
+            .is_some_and(|playlist| !playlist.id.is_empty());
+        if spotify_owned
+            && self
+                .connect
+                .as_ref()
+                .is_some_and(|s| !s.can_edit_playlists())
+        {
+            self.connect_error = Some(
+                "Reconnect Spotify once to remove songs from a playlist saved on Spotify."
+                    .to_string(),
+            );
+            self.notify("Reconnect Spotify once to edit Spotify playlists");
+            return;
+        }
         let Some(playlist) = self.imported.get(imported_i) else {
             return;
         };
@@ -1651,6 +1725,19 @@ impl App {
     }
 
     fn set_playing(&mut self, on: bool) {
+        if self.native_direct {
+            self.pending_play_uri = None;
+            self.wake = None;
+            self.backend.send(if on {
+                backend::PlayerCommand::Resume
+            } else {
+                backend::PlayerCommand::Pause
+            });
+            self.playing = on;
+            self.connect_stamp = Some(std::time::Instant::now());
+            self.transport_at = Some(std::time::Instant::now());
+            return;
+        }
         // A manual transport press takes the sleep fade back to full volume;
         // the timer itself clears the fade before pausing.
         if self.sleep_fade.take().is_some() {
@@ -1703,6 +1790,31 @@ impl App {
             }
             self.connect_stamp = Some(std::time::Instant::now());
             self.transport_at = Some(std::time::Instant::now());
+            return;
+        }
+        // A signed-in account with a Web API session owns the song even before
+        // its device list answers. Pressing play must wait for that device
+        // instead of starting a preview the owner did not ask for.
+        let stream_elsewhere = self.profile.stream_mode != StreamMode::Preview
+            && self.spotify_connected()
+            && self
+                .connect
+                .as_ref()
+                .is_some_and(|s| s.can_control_playback())
+            && self.cur().is_some_and(|track| {
+                track.path.is_none()
+                    && self.audio_lib.find(&track.title, &track.artist).is_none()
+            });
+        if on && stream_elsewhere {
+            self.local_override = false;
+            self.audio.stop();
+            self.preview.cancel();
+            self.previewing = false;
+            self.preview_file = None;
+            self.playing = true;
+            self.transport_at = Some(std::time::Instant::now());
+            self.play_current_on_spotify();
+            self.notify("Waiting for Spotify to answer...");
             return;
         }
         self.playing = on;
@@ -1759,6 +1871,27 @@ impl App {
         self.play_row(&coll, ti);
     }
 
+    /// Plays the row under the transport as a Spotify context, so the play
+    /// button uses the same in-order queue as a row click instead of dropping
+    /// to a preview while the device list is still empty.
+    fn play_current_on_spotify(&mut self) {
+        let Some(track) = self.cur().cloned() else {
+            return;
+        };
+        if let Some(coll) = self
+            .lib
+            .iter()
+            .find(|coll| coll.tracks.iter().any(|t| t.key() == track.key()))
+            .cloned()
+        {
+            if let Some(ti) = coll.tracks.iter().position(|t| t.key() == track.key()) {
+                self.play_collection_on_spotify(&coll, ti);
+                return;
+            }
+        }
+        self.play_search_on_spotify(&track);
+    }
+
     /// Plays one row from a collection view. A row that carries its own file is
     /// always the file on this PC, even in Spotify mode; the rest follow the
     /// mode: Spotify gets a name search, or the local index gets a last look.
@@ -1787,6 +1920,26 @@ impl App {
             self.play_from(coll, ti);
             return;
         }
+        if self.native_direct {
+            // This session cannot use Connect, but librespot can still stream
+            // the exact track. Send the URI straight to the native player so a
+            // Web API rate limit cannot turn a full song into a preview.
+            if let Some(uri) = self.track_uri_for(coll, ti) {
+                self.local_override = false;
+                self.audio.stop();
+                self.preview.cancel();
+                self.previewing = false;
+                self.preview_file = None;
+                self.pending_play_uri = None;
+                self.wake = None;
+                self.play_from(coll, ti);
+                self.audio.stop();
+                self.backend
+                    .send(backend::PlayerCommand::PlayTrack(uri));
+                self.notify("Full song - librespot");
+                return;
+            }
+        }
         if self.spotify_ready() {
             // Spotify owns playback in this mode. A linked playlist is played
             // as a context at this row, so Spotify advances in playlist order
@@ -1795,6 +1948,23 @@ impl App {
             self.audio.stop();
             self.play_from(coll, ti);
             self.play_collection_on_spotify(coll, ti);
+            return;
+        }
+        if self
+            .spotify_connected()
+            && self
+                .connect
+                .as_ref()
+                .is_some_and(|s| s.can_control_playback())
+        {
+            // Spotify is connected but its device list has not answered yet.
+            // Waiting for it is the difference between a full song and a
+            // surprise preview; tick_pending_play opens Spotify if needed.
+            self.local_override = false;
+            self.audio.stop();
+            self.play_from(coll, ti);
+            self.play_collection_on_spotify(coll, ti);
+            self.notify("Waiting for Spotify to answer...");
             return;
         }
         if self.profile.stream_mode == StreamMode::Full {
@@ -2329,7 +2499,11 @@ impl App {
     fn body(&mut self, ui: &mut egui::Ui) {
         self.header(ui);
         ui.add_space(4.0);
-        if self.connect.is_none() && self.view != View::Import {
+        if self.view != View::Import
+            && (self.connect.is_none()
+                || self.native_failed
+                || self.connect.as_ref().is_some_and(|s| s.needs_reconnect()))
+        {
             self.connect_banner(ui);
         }
 
@@ -2477,6 +2651,24 @@ impl App {
     /// player, so the way in should not be buried on the Import page.
     fn connect_banner(&mut self, ui: &mut egui::Ui) {
         let t = self.theme();
+        let needs_scope = self.connect.as_ref().is_some_and(|s| s.needs_reconnect());
+        let native_down = self.native_failed && self.connect.is_some();
+        let native_only = native_down && !needs_scope;
+        let stale = needs_scope;
+        let label = if native_only {
+            "Open Spotify"
+        } else if stale {
+            "Reconnect Spotify"
+        } else {
+            "Connect Spotify"
+        };
+        let message: String = if native_only {
+            "Full songs play through your Spotify app with this sign-in. Open Spotify once; Rustify keeps the transport controls when Spotify answers.".to_string()
+        } else if stale {
+            "Your saved Spotify sign-in still controls the Spotify app, but it is from an older version. Reconnect once (no Client ID needed) for in-app full songs and playlist editing.".to_string()
+        } else {
+            "Spotify is not connected - rows can only play a 30-second preview. Connect once for full songs (Premium).".to_string()
+        };
         egui::Frame::new()
             .fill(t.card)
             .corner_radius(egui::CornerRadius::same(8))
@@ -2495,21 +2687,21 @@ impl App {
                             }
                         } else {
                             let button = egui::Button::new(
-                                RichText::new("Connect Spotify").color(t.on_accent),
+                                RichText::new(label).color(t.on_accent),
                             )
                             .fill(t.accent);
                             if ui.add(button).clicked() {
-                                self.view = View::Import;
-                                self.start_connect();
+                                if native_only {
+                                    open_spotify_app();
+                                } else {
+                                    self.view = View::Import;
+                                    self.start_connect();
+                                }
                             }
                         }
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.label(
-                                RichText::new(
-                                    "Spotify is not connected - rows can only play a 30-second preview. Connect once for full songs (Premium).",
-                                )
-                                .size(12.0)
-                                .color(t.muted),
+                                RichText::new(message.clone()).size(12.0).color(t.muted),
                             );
                         });
                     });
@@ -3766,9 +3958,71 @@ impl App {
     /// transport back to Spotify instead of falling to a preview.
     fn spotify_ready(&self) -> bool {
         self.spotify_connected()
-            && (self.native_device.is_some()
+            && (self.native_ready
+                || self.native_device.is_some()
                 || self.web_device.is_some()
-                || self.picked_device.is_some())
+                || self.picked_device.is_some()
+                || self.fallback_device_id().is_some())
+    }
+
+    /// Device to fall back to when librespot cannot stream: an installed
+    /// spotifyd daemon first, then the active Spotify client, then this PC's
+    /// Spotify app. It stays out of the way while a native sign-in is still
+    /// warming up, so a fresh librespot session is never pre-empted.
+    fn fallback_device_id(&self) -> Option<String> {
+        // The native engine is live; commands go to its active Connect device.
+        if self.native_ready {
+            return None;
+        }
+        // rspotify is a fallback for a signed-in account, never a way to make
+        // the transport Spotify-owned without one.
+        let session = self.connect.as_ref()?;
+        let waiting_for_native = session.can_stream()
+            && !self.native_failed
+            && self.native_device.is_none();
+        if waiting_for_native || !session.can_control_playback() {
+            return None;
+        }
+        self.devices
+            .iter()
+            .find(|d| d.name.to_ascii_lowercase().contains("spotifyd"))
+            .or_else(|| self.devices.iter().find(|d| d.active))
+            .or_else(|| {
+                self.devices
+                    .iter()
+                    .find(|d| d.kind.eq_ignore_ascii_case("computer"))
+            })
+            .or_else(|| self.devices.first())
+            .map(|d| d.id.clone())
+    }
+
+    /// Which engine is actually making sound, for the status line under the
+    /// player bar. Native streaming wins; spotifyd is the second engine, the
+    /// owner's Spotify app through rspotify is the third, previews the last.
+    fn engine_name(&self) -> &'static str {
+        if self.native_direct {
+            return "full songs - librespot direct";
+        }
+        if self.native_ready || self.native_device.is_some() {
+            return "full songs - librespot";
+        }
+        if self
+            .devices
+            .iter()
+            .any(|d| d.name.to_ascii_lowercase().contains("spotifyd"))
+        {
+            return "full songs - spotifyd";
+        }
+        if self.web_device.is_some()
+            || self.picked_device.is_some()
+            || !self.devices.is_empty()
+        {
+            return "full songs - Spotify app";
+        }
+        if self.connect.is_some() {
+            return "waiting for a Spotify device";
+        }
+        "30-second preview"
     }
 
     /// True when Spotify is the one making sound. The in-app SDK has to have
@@ -3814,12 +4068,14 @@ impl App {
     fn audio_status(&self) -> Option<&'static str> {
         if self.spotify_playing() {
             if self.wake.is_some() {
-                return Some("waiting for the in-app player...");
+                return Some("waiting for a Spotify device...");
             }
             // Only explain the silence when sound was actually asked for. An
             // idle session with nothing playing is not an error.
-            return (self.playing && self.connect_playback.is_none())
-                .then_some("no active Spotify device");
+            if self.playing && self.connect_playback.is_none() {
+                return Some("no active Spotify device");
+            }
+            return Some(self.engine_name());
         }
         if !self.playing {
             return None;
@@ -3848,6 +4104,9 @@ impl App {
             });
         }
         if self.previewing {
+            if self.connect.as_ref().is_some_and(|s| s.needs_reconnect()) {
+                return Some("30-second preview - reconnect Spotify for full songs");
+            }
             return Some(if self.profile.stream_mode == StreamMode::Preview {
                 "30-second preview - previews only"
             } else {
@@ -3870,7 +4129,13 @@ impl App {
         let target = self
             .devices
             .iter()
-            .find(|d| d.active)
+            .find(|d| d.name.to_ascii_lowercase().contains("spotifyd"))
+            .or_else(|| self.devices.iter().find(|d| d.active))
+            .or_else(|| {
+                self.devices
+                    .iter()
+                    .find(|d| d.kind.eq_ignore_ascii_case("computer"))
+            })
             .or_else(|| self.devices.first())
             .map(|d| d.id.clone());
         match target {
@@ -3897,9 +4162,16 @@ impl App {
                 return Some(id.clone());
             }
         }
-        // Never fall back to an arbitrary Spotify client: the native player is
-        // the point, and desktop Spotify must not be silently required.
-        self.web_device.clone()
+        // The native device is active but may not have reached the device list
+        // yet (or that call was rate-limited). An empty id tells Spotify to use
+        // the active device, which is the one librespot just registered.
+        if self.native_ready {
+            return Some(String::new());
+        }
+        // The native engine could not start (or this session predates native
+        // streaming): hand playback to spotifyd, then to the owner's Spotify
+        // app through rspotify. Preview is only reached when neither exists.
+        self.fallback_device_id().or_else(|| self.web_device.clone())
     }
 
     /// Hands a track or context to Spotify. With no Spotify client running
@@ -3950,6 +4222,19 @@ impl App {
     /// The Spotify id for a visible playlist, but only when the rows still
     /// line up with the saved import. A renamed or edited local copy is not
     /// silently treated as the Spotify original.
+    fn track_uri_for(&self, coll: &Collection, ti: usize) -> Option<String> {
+        if !coll.imported() {
+            return None;
+        }
+        let id = self.imported_playlist_id(coll)?;
+        self.imported
+            .iter()
+            .find(|playlist| playlist.id == id)
+            .and_then(|playlist| playlist.tracks.get(ti))
+            .map(|track| track.uri.clone())
+            .filter(|uri| !uri.is_empty())
+    }
+
     fn imported_playlist_id(&self, coll: &Collection) -> Option<String> {
         self.imported
             .iter()
@@ -4005,6 +4290,16 @@ impl App {
             resume,
         });
         self.device_asked = None;
+        // A saved session from before native streaming can only play full
+        // songs through the Spotify app. Open it once so there is a device to
+        // hand the track to, instead of waiting twenty seconds for nothing.
+        if self
+            .connect
+            .as_ref()
+            .is_some_and(|s| s.can_control_playback() && !s.can_stream())
+        {
+            open_spotify_app();
+        }
         self.request_devices();
     }
 
@@ -4063,6 +4358,9 @@ impl App {
         while let Some(event) = self.backend.poll() {
             match event {
                 backend::PlayerEvent::Authenticated(user) => {
+                    self.native_failed = false;
+                    self.native_ready = true;
+                    self.native_direct = !user.connect_device;
                     if cfg!(debug_assertions) {
                         eprintln!(
                             "[backend] authenticated as {} ({})",
@@ -4096,20 +4394,45 @@ impl App {
                     if cfg!(debug_assertions) {
                         eprintln!("[backend] error: {error}");
                     }
+                    // The native engine is unavailable from here on. Keep the
+                    // Web API fallback in charge instead of dropping to a
+                    // preview whenever the account can still control Spotify.
+                    self.native_failed = true;
+                    self.native_ready = false;
+                    self.native_direct = false;
+                    self.native_device = None;
                     if premium_error(&error) {
-                        self.native_device = None;
-                        self.local_override = true;
-                        // The free preview is not gated by Premium. Start it
-                        // so a Free account gets sound and a readable Error
-                        // event instead of a dead transport.
-                        if self.profile.stream_mode != StreamMode::Full {
-                            if let Some(track) = self.cur().cloned() {
-                                self.start_preview(&track);
+                        let fallback = self
+                            .connect
+                            .as_ref()
+                            .is_some_and(|s| s.can_control_playback());
+                        if fallback {
+                            self.local_override = false;
+                            self.connect_log.push_str(
+                                "Native audio is unavailable; playing through the Spotify app instead.\n",
+                            );
+                        } else {
+                            self.local_override = true;
+                            // The free preview is not gated by Premium. Start it
+                            // so a Free account gets sound and a readable Error
+                            // event instead of a dead transport.
+                            if self.profile.stream_mode != StreamMode::Full {
+                                if let Some(track) = self.cur().cloned() {
+                                    self.start_preview(&track);
+                                }
                             }
                         }
                     }
+                    let using_fallback = self
+                        .connect
+                        .as_ref()
+                        .is_some_and(|s| s.can_control_playback());
                     self.connect_error = Some(error.clone());
-                    self.notify(error);
+                    self.notify(if using_fallback {
+                        "Native player unavailable - using your Spotify app".to_string()
+                    } else {
+                        error
+                    });
                 }
             }
         }
@@ -4119,7 +4442,11 @@ impl App {
         if self.connect_busy {
             return;
         }
-        let client_id = self.client_id.trim().to_string();
+        let client_id = if self.client_id.trim().is_empty() {
+            self.profile.client_id.trim().to_string()
+        } else {
+            self.client_id.trim().to_string()
+        };
         if client_id.is_empty() {
             self.connect_error = Some("Paste your Spotify app Client ID first.".to_string());
             return;
@@ -4157,6 +4484,7 @@ impl App {
     /// official previews keep working, so Spotify is never required to start
     /// the app with sound.
     fn attach_session(&mut self, session: connect::Session, activate: bool) {
+        let native = session.can_stream();
         let link = conn_worker::spawn(session.clone(), connect::default_path());
         self.connect = Some(session);
         self.web_tried = false;
@@ -4167,10 +4495,16 @@ impl App {
         self.spotify_mode = activate;
         self.local_override = false;
         if activate {
-            // One audio engine: the native Connect device. It reuses the
-            // sealed session the UI just loaded, so this never opens a second
-            // browser window or registers the old WebView player too.
-            self.backend.send(backend::PlayerCommand::Login);
+            if native {
+                // One audio engine: the native Connect device. It reuses the
+                // sealed session the UI just loaded, so this never opens a
+                // second browser window or registers the old WebView player.
+                self.backend.send(backend::PlayerCommand::Login);
+            } else {
+                self.connect_log.push_str(
+                    "Saved sign-in controls your Spotify app. Reconnect once for in-app full songs and playlist editing.\n",
+                );
+            }
             // Signing in is the moment a preview can become the full song:
             // stop the clip and hand the current track to Spotify instead of
             // leaving the 30 seconds playing.
@@ -4198,6 +4532,9 @@ impl App {
         self.connect_stamp = None;
         self.pending_play_uri = None;
         self.native_device = None;
+        self.native_failed = false;
+        self.native_ready = false;
+        self.native_direct = false;
         self.remove_pending = None;
         self.device_asked = None;
         self.wake = None;
@@ -4580,6 +4917,7 @@ impl App {
                                     client_id: self.profile.client_id.clone(),
                                     endpoints: spotify::Endpoints::default(),
                                     tokens,
+                                    scope_rev: connect::SCOPE_REV,
                                 };
                                 let saved = connect::save(&connect::default_path(), &session);
                                 if saved {
@@ -5950,7 +6288,12 @@ impl App {
                         let bar_w = (ui.available_width() - 58.0).max(60.0);
                         if let Some(f) = bar(ui, &t, frac, bar_w) {
                             self.pos = f * dur;
-                            if self.spotify_playing() {
+                            if self.native_direct && self.spotify_playing() {
+                                self.backend.send(backend::PlayerCommand::Seek(
+                                    (self.pos * 1000.0).max(0.0) as u32,
+                                ));
+                                self.connect_stamp = Some(std::time::Instant::now());
+                            } else if self.spotify_playing() {
                                 self.connect_command(connect::Command::Seek(
                                     (self.pos * 1000.0).max(0.0) as u64,
                                 ));
@@ -9487,8 +9830,11 @@ mod conn_worker {
                         Err(e) => {
                             // A rate-limited player endpoint stays limited for
                             // a while; polling every 1.2 s only deepens it.
+                            // A 429 window is account-wide; polling it every
+                            // few seconds keeps the limit alive. Back off for a
+                            // minute so Spotify can reset it.
                             poll_every = if e.contains("rate limiting") {
-                                Duration::from_secs(15)
+                                Duration::from_secs(60)
                             } else {
                                 Duration::from_millis(1200)
                             };
@@ -9595,6 +9941,146 @@ fn advance_one_frame(app: &mut App) {
     input.time = Some(1.0);
     input.predicted_dt = 0.016;
     let _ = ctx.run(input, |ctx| app.advance(ctx));
+}
+
+/// End-to-end check of the rspotify fallback: refresh the sealed session,
+/// find a Spotify Connect device (opening the desktop app if needed), hand it
+/// a real playlist context, and report the playback state Spotify returns.
+/// This is the engine a session without the streaming scope can still use.
+fn engine_smoke() -> Result<String, String> {
+    let profile = Profile::load_from(&Profile::default_path());
+    let mut session = connect::load(&connect::default_path(), &profile.client_id)
+        .ok_or_else(|| "no saved Spotify session; reconnect once first".to_string())?;
+    let http = spotify::Curl;
+    if connect::ensure_fresh(&http, &mut session)?
+        && !connect::save(&connect::default_path(), &session)
+    {
+        return Err("the refreshed session could not be sealed".to_string());
+    }
+    let api = session.endpoints.api.clone();
+    let token = session.tokens.access.clone();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "session_scope_rev={} stream={} control={} expired={}\n",
+        session.scope_rev,
+        session.can_stream(),
+        session.can_control_playback(),
+        session.tokens.expired()
+    ));
+
+    let mut devices = connect::devices(&http, &api, &token).map_err(|e| e.to_string())?;
+    if devices.is_empty() {
+        out.push_str("devices=none\n");
+        open_spotify_app();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            devices = connect::devices(&http, &api, &token).map_err(|e| e.to_string())?;
+            if !devices.is_empty() {
+                break;
+            }
+        }
+    }
+    for device in &devices {
+        out.push_str(&format!(
+            "device={} name={} active={} kind={}\n",
+            device.id, device.name, device.active, device.kind
+        ));
+    }
+    let pick = devices
+        .iter()
+        .find(|d| d.name.to_ascii_lowercase().contains("spotifyd"))
+        .or_else(|| devices.iter().find(|d| d.active))
+        .or_else(|| devices.iter().find(|d| d.kind.eq_ignore_ascii_case("computer")))
+        .or_else(|| devices.first())
+        .ok_or_else(|| "Spotify never offered a playback device".to_string())?;
+    out.push_str(&format!("picked={} {}\n", pick.name, pick.id));
+
+    let store = spotify::load(&spotify::default_path());
+    let playlist = store
+        .iter()
+        .find(|p| !p.id.is_empty() && !p.tracks.is_empty())
+        .ok_or_else(|| "no imported Spotify playlist to test with".to_string())?;
+    out.push_str(&format!(
+        "context=spotify:playlist:{} ({})\n",
+        playlist.id, playlist.name
+    ));
+    connect::command(
+        &http,
+        &api,
+        &token,
+        connect::Command::PlayContext {
+            uri: format!("spotify:playlist:{}", playlist.id),
+            offset: Some(0),
+            device: Some(pick.id.clone()),
+        },
+    )?;
+    out.push_str("play_sent=true\n");
+
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        if let Some(state) = connect::state(&http, &api, &token)? {
+            out.push_str(&format!(
+                "state playing={} device={} track={} progress_ms={}\n",
+                state.playing, state.device, state.track, state.progress_ms
+            ));
+            if state.playing {
+                return Ok(out);
+            }
+        }
+    }
+    Err(format!("Spotify accepted the command but never reported playback\n{out}"))
+}
+
+/// Prints the playback engine order and what this machine can actually use.
+/// No token is printed: only whether a sealed session exists and which
+/// capabilities its scope revision was granted.
+fn backends_report() -> String {
+    let profile = Profile::load_from(&Profile::default_path());
+    let session = connect::load(&connect::default_path(), &profile.client_id);
+    let mut out = String::new();
+    out.push_str("engine_order=librespot,spotifyd,rspotify,preview\n");
+    out.push_str(&format!(
+        "librespot=embedded device={}\n",
+        backend::DEVICE_NAME
+    ));
+    match backend::spotifyd_path() {
+        Some(path) => out.push_str(&format!("spotifyd=found path={}\n", path.display())),
+        None => out.push_str("spotifyd=not_found\n"),
+    }
+    out.push_str("rspotify=embedded\n");
+    out.push_str(&format!(
+        "client_id={}\n",
+        if profile.client_id.trim().is_empty() {
+            "missing"
+        } else {
+            "set"
+        }
+    ));
+    match &session {
+        Some(session) => {
+            out.push_str(&format!("session=scope_rev_{}\n", session.scope_rev));
+            out.push_str(&format!("session_control={}\n", session.can_control_playback()));
+            out.push_str(&format!("session_stream={}\n", session.can_stream()));
+            out.push_str(&format!("session_edit={}\n", session.can_edit_playlists()));
+            out.push_str(&format!("session_expired={}\n", session.tokens.expired()));
+            out.push_str(&format!(
+                "session_scopes={}\n",
+                if session.tokens.scopes.is_empty() {
+                    "unknown"
+                } else {
+                    session.tokens.scopes.as_str()
+                }
+            ));
+        }
+        None => out.push_str("session=none\n"),
+    }
+    let engine = match &session {
+        Some(session) if session.can_stream() => "librespot (spotifyd/rspotify fallback)",
+        Some(session) if session.can_control_playback() => "rspotify (Spotify app)",
+        _ => "preview",
+    };
+    out.push_str(&format!("selected={engine}\n"));
+    out
 }
 
 /// Runs the four feature checks against a temporary copy of the real store.
