@@ -5787,12 +5787,14 @@ dependencies = [
 
 [[package]]
 name = "spotify-rust"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "chrono",
  "eframe",
+ "env_logger",
  "image",
  "librespot",
+ "librespot-oauth",
  "raw-window-handle",
  "rodio 0.22.2",
  "rspotify",

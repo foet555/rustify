@@ -1,6 +1,6 @@
 [package]
 name = "spotify-rust"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 license = "MIT"
 
@@ -20,6 +20,11 @@ raw-window-handle = "0.6"
 # Connect; rspotify reads metadata and checks the account's product. Both use
 # rustls so Windows does not need an external TLS/audio SDK.
 librespot = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "rodio-backend"] }
+# Keymaster OAuth, so librespot gets reusable credentials instead of a Web API
+# token that cannot use Connect. Uses the same rustls stack as librespot.
+librespot-oauth = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# Diagnostics for the headless native playback check. Not used by the UI.
+env_logger = "0.11"
 rspotify = { version = "0.16.1", default-features = false, features = ["client-reqwest", "reqwest-rustls-tls"] }
 # The backend owns its own runtime/thread so catalog fetches and audio never
 # touch the egui frame loop.

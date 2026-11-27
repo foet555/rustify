@@ -8,6 +8,7 @@ mod art;
 mod catalog;
 mod gate;
 mod library;
+mod native_auth;
 mod pairing;
 mod preview;
 mod profile;
@@ -195,6 +196,28 @@ fn main() -> eframe::Result {
         print!("{}", backends_report());
         return Ok(());
     }
+    if args.iter().any(|a| a == "--native-play-smoke") {
+        let uri = arg_value(&args, "--native-play-smoke")
+            .unwrap_or("spotify:track:3saamsF6XnDbzJcuduVgmf");
+        match backend::native_play_smoke(uri) {
+            Ok(report) => print!("{report}"),
+            Err(error) => {
+                eprintln!("native play smoke failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--native-login") {
+        match native_auth::login() {
+            Ok(report) => print!("{report}\n"),
+            Err(error) => {
+                eprintln!("native login failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--native-smoke") {
         match backend::native_smoke() {
             Ok(report) => print!("{report}"),
@@ -324,6 +347,7 @@ enum LibFilter {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsTab {
     Playback,
+    Spotify,
     Appearance,
     Privacy,
     Phone,
@@ -426,6 +450,11 @@ struct App {
     /// OAuth session cannot register a Connect device. Clicks then go to
     /// librespot instead of the Web API.
     native_direct: bool,
+    /// Keymaster sign-in runs in a thread so the UI keeps drawing while the
+    /// owner approves the consent page in their browser.
+    native_auth_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    native_auth_running: bool,
+    native_auth_status: Option<String>,
     /// Isolated tokio worker for librespot playback and rspotify metadata.
     backend: backend::Backend,
     connect_playback: Option<connect::Playback>,
@@ -825,6 +854,9 @@ impl App {
             native_failed: false,
             native_ready: false,
             native_direct: false,
+            native_auth_rx: None,
+            native_auth_running: false,
+            native_auth_status: None,
             picked_device: None,
             web_token_asked: None,
             web_token_at: None,
@@ -951,6 +983,9 @@ impl App {
             native_failed: false,
             native_ready: false,
             native_direct: false,
+            native_auth_rx: None,
+            native_auth_running: false,
+            native_auth_status: None,
             picked_device: None,
             web_token_asked: None,
             web_token_at: None,
@@ -4438,6 +4473,52 @@ impl App {
         }
     }
 
+    fn start_native_auth(&mut self) {
+        if self.native_auth_running {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(native_auth::login());
+        });
+        self.native_auth_rx = Some(rx);
+        self.native_auth_running = true;
+        self.native_auth_status = Some("Waiting for Spotify approval in your browser...".to_string());
+        self.notify("Approve Spotify in your browser, then return");
+    }
+
+    fn poll_native_auth(&mut self) {
+        let Some(rx) = &self.native_auth_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(report)) => {
+                self.native_auth_running = false;
+                self.native_auth_rx = None;
+                self.native_auth_status = Some(report.clone());
+                self.connect_log.push_str(&format!("Native player: {report}\n"));
+                self.native_failed = false;
+                self.native_direct = false;
+                // The worker loads the sealed credential itself; this only
+                // asks it to register the Connect device again.
+                self.backend.send(backend::PlayerCommand::Login);
+                self.notify("Native player ready - full songs can stream in Rustify");
+            }
+            Ok(Err(error)) => {
+                self.native_auth_running = false;
+                self.native_auth_rx = None;
+                self.native_auth_status = Some(format!("Native sign-in failed: {error}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.native_auth_running = false;
+                self.native_auth_rx = None;
+                self.native_auth_status =
+                    Some("Native sign-in stopped before Spotify answered.".to_string());
+            }
+        }
+    }
+
     fn start_connect(&mut self) {
         if self.connect_busy {
             return;
@@ -7206,6 +7287,7 @@ impl App {
                 ui.set_width(350.0);
                 let mut tabs = vec![
                     (SettingsTab::Playback, "Playback"),
+                    (SettingsTab::Spotify, "Spotify"),
                     (SettingsTab::Appearance, "Appearance"),
                     (SettingsTab::Privacy, "Privacy"),
                     (SettingsTab::Phone, "Phone"),
@@ -7454,6 +7536,68 @@ impl App {
                                     .color(current.accent),
                                 );
                             }
+                        }
+
+                        if tab == SettingsTab::Spotify {
+                            ui.label(
+                                RichText::new("Spotify account").size(13.0).color(current.text),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "The native engine uses Spotify's keymaster sign-in, separate from the Web API Client ID on the Import page.",
+                                )
+                                .size(10.5)
+                                .color(current.faint),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Native player (full songs)")
+                                    .size(11.5)
+                                    .color(current.muted),
+                            );
+                            let native_saved = native_auth::default_path().exists();
+                            ui.label(
+                                RichText::new(if native_saved {
+                                    "Spotify keymaster credential saved, sealed with Windows DPAPI."
+                                } else {
+                                    "Not set up. Full songs currently fall back to your Spotify app."
+                                })
+                                .size(10.0)
+                                .color(current.faint),
+                            );
+                            let native_button = egui::Button::new(
+                                RichText::new(if native_saved {
+                                    "Reconnect native player"
+                                } else {
+                                    "Set up native player"
+                                })
+                                .color(current.on_accent),
+                            )
+                            .fill(current.accent)
+                            .corner_radius(egui::CornerRadius::same(6));
+                            if ui
+                                .add_enabled(!self.native_auth_running, native_button)
+                                .clicked()
+                            {
+                                self.start_native_auth();
+                            }
+                            if let Some(status) = &self.native_auth_status {
+                                ui.label(
+                                    RichText::new(status).size(10.0).color(current.accent),
+                                );
+                            }
+                            ui.label(
+                                RichText::new(format!("Active engine: {}", self.engine_name()))
+                                    .size(10.0)
+                                    .color(current.muted),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Opens Spotify's consent page in your browser. No password is stored; Rustify keeps only a Windows-sealed reusable credential. Spotify still refuses audio keys for accounts created after its 2024/25 cutoff; those accounts play through the official Spotify app.",
+                                )
+                                .size(10.0)
+                                .color(current.faint),
+                            );
                         }
 
                         if tab == SettingsTab::Appearance {
@@ -8318,6 +8462,7 @@ impl App {
         self.poll_import(ctx);
         self.poll_connect(ctx);
         self.poll_backend();
+        self.poll_native_auth();
         self.tick_web_player(ctx);
         self.request_missing_covers();
         self.poll_preview(ctx);
@@ -10043,6 +10188,15 @@ fn backends_report() -> String {
         "librespot=embedded device={}\n",
         backend::DEVICE_NAME
     ));
+    out.push_str(&format!(
+        "native_keymaster={}\n",
+        if native_auth::default_path().exists() {
+            "saved"
+        } else {
+            "missing"
+        }
+    ));
+    out.push_str("native_audio_key_note=Spotify refuses keys for accounts created after its 2024/25 cutoff (librespot #1649)\n");
     match backend::spotifyd_path() {
         Some(path) => out.push_str(&format!("spotifyd=found path={}\n", path.display())),
         None => out.push_str("spotifyd=not_found\n"),
@@ -11378,6 +11532,7 @@ mod frame_tests {
             (SettingsTab::Playback, "Previews only"),
             (SettingsTab::Playback, "Volume normalization"),
             (SettingsTab::Playback, "Target"),
+            (SettingsTab::Spotify, "Native player (full songs)"),
             (SettingsTab::Appearance, "Animated intro on launch"),
             (SettingsTab::Appearance, "App behavior"),
             (SettingsTab::Appearance, "Accent colour"),

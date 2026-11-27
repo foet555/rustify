@@ -41,6 +41,13 @@ use crate::spotify::{self, Curl, Endpoints};
 pub const PREMIUM_REQUIRED: &str =
     "Spotify Premium is required to stream full songs in Rustify. Sign in with a Premium account.";
 
+/// Spotify refuses audio decryption keys for accounts created after its 2024/25
+/// cutoff (librespot issue #1649). The session and Connect device still work,
+/// but every track is skipped. The UI turns this into a clear fallback instead
+/// of pretending the sign-in failed.
+pub const NATIVE_AUDIO_KEY_LIMIT: &str =
+    "Spotify refused the audio key for this account. librespot (and spotifyd) cannot decrypt newer Spotify accounts; full songs play through the official Spotify app instead.";
+
 /// The single Spotify Connect device this application registers. The UI looks
 /// for this name to route playback to the native engine and never starts the
 /// old hidden WebView player alongside it.
@@ -335,21 +342,17 @@ impl Worker {
             .and_then(|me| me.display_name.clone())
             .unwrap_or_else(|| user_id.clone());
 
-        let credentials = Credentials::with_access_token(session.tokens.access.clone());
+        // Prefer the reusable keymaster credentials from native_auth. A Web
+        // API access token can read and control playback but cannot use
+        // keymaster, so Spirc registration and audio keys fail with it.
+        let credentials = crate::native_auth::load()
+            .unwrap_or_else(|| Credentials::with_access_token(session.tokens.access.clone()));
         let librespot_session = LibrespotSession::new(SessionConfig::default(), None);
-        librespot_session
-            .connect(credentials.clone(), false)
-            .await
-            .map_err(playback_error)?;
-
-        // librespot's ProductInfo packet arrives just after `connect` returns.
-        // Wait for the account type before creating a player: the patched
-        // librespot-core logs a Free account instead of exiting, and this check
-        // turns that into the documented Error event.
-        verify_account_type(&librespot_session).await?;
-        if product == "unknown" {
-            product = "premium";
-        }
+        // Do not connect this session here. Spirc::new calls Session::connect
+        // itself; connecting first makes that second connect tear the session
+        // down, which surfaced as `Service unavailable { Session is not
+        // connected }`. Verify the account type after Spirc is up.
+        let verify_session = librespot_session.clone();
 
         let mixer_factory = mixer::find(None)
             .ok_or_else(|| "No Spotify audio mixer is available in this build.".to_string())?;
@@ -374,14 +377,23 @@ impl Worker {
         let progress_tx = self.events.clone();
         tokio::spawn(async move {
             while let Some(event) = player_events.recv().await {
-                if let LibrespotEvent::PositionChanged { position_ms, .. } = event {
-                    if progress_tx
-                        .send(PlayerEvent::Progress(position_ms))
-                        .await
-                        .is_err()
-                    {
+                match event {
+                    LibrespotEvent::PositionChanged { position_ms, .. } => {
+                        if progress_tx
+                            .send(PlayerEvent::Progress(position_ms))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    LibrespotEvent::Unavailable { .. } => {
+                        let _ = progress_tx
+                            .send(PlayerEvent::Error(NATIVE_AUDIO_KEY_LIMIT.to_string()))
+                            .await;
                         break;
                     }
+                    _ => {}
                 }
             }
         });
@@ -399,6 +411,16 @@ impl Worker {
         )
         .await
         .map_err(playback_error)?;
+        // Spirc connects and authenticates the session. ProductInfo arrives on
+        // the dispatch task; the patched librespot-core logs a Free account
+        // instead of exiting, and this turns it into the documented error.
+        if let Err(error) = verify_account_type(&verify_session).await {
+            let _ = spirc.shutdown();
+            return Err(error);
+        }
+        if product == "unknown" {
+            product = "premium";
+        }
         tokio::spawn(task);
         spirc.activate().map_err(playback_error)?;
         self.spirc = Some(spirc);
@@ -660,6 +682,105 @@ pub fn native_smoke() -> Result<String, String> {
             "native=ok account=premium device={DEVICE_NAME} scopes_streaming=true\n"
         ));
         Ok(out)
+    })
+}
+
+/// Headless proof of the native engine using the sealed keymaster credentials.
+/// Registers Spirc, loads a real track, and waits for position to pass 60 s.
+/// No Web API call is made, so a 429 cannot mask a playback failure.
+pub fn native_play_smoke(uri: &str) -> Result<String, String> {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("librespot=debug"),
+    )
+    .try_init();
+    let credentials = crate::native_auth::load()
+        .ok_or_else(|| "no native keymaster credential; run --native-login first".to_string())?;
+    let target = SpotifyUri::from_uri(uri)
+        .map_err(|error| format!("invalid Spotify track URI: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start the audio runtime: {error}"))?;
+    runtime.block_on(async move {
+        let session = LibrespotSession::new(SessionConfig::default(), None);
+        // Spirc::new performs the session connect. Connecting here would make
+        // the second connect fail with "Session is not connected".
+        let session_for_verify = session.clone();
+        let mixer_factory = mixer::find(None)
+            .ok_or_else(|| "no Spotify audio mixer is available in this build".to_string())?;
+        let mixer = mixer_factory(MixerConfig::default()).map_err(playback_error)?;
+        let sink_builder = audio_backend::find(None)
+            .ok_or_else(|| "no Spotify audio output is available in this build".to_string())?;
+        let player = Player::new(
+            PlayerConfig {
+                position_update_interval: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+            session.clone(),
+            mixer.get_soft_volume(),
+            move || sink_builder(None, AudioFormat::default()),
+        );
+        let mut events = player.get_player_event_channel();
+        let (spirc, task) = Spirc::new(
+            ConnectConfig {
+                name: DEVICE_NAME.to_string(),
+                ..Default::default()
+            },
+            session,
+            credentials,
+            player,
+            mixer,
+        )
+        .await
+        .map_err(playback_error)?;
+        tokio::spawn(task);
+        spirc.activate().map_err(playback_error)?;
+        if let Err(error) = verify_account_type(&session_for_verify).await {
+            let _ = spirc.shutdown();
+            return Err(error);
+        }
+        // Give the Connect state a moment to publish the device before load.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        spirc
+            .load(LoadRequest::from_tracks(
+                vec![target.to_string()],
+                LoadRequestOptions {
+                    start_playing: true,
+                    ..Default::default()
+                },
+            ))
+            .map_err(playback_error)?;
+        let mut position_ms = 0u32;
+        let mut playing = false;
+        for _ in 0..75 {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(LibrespotEvent::PositionChanged { position_ms: at, .. })) => {
+                    position_ms = at;
+                }
+                Ok(Some(LibrespotEvent::Playing { .. })) => playing = true,
+                Ok(Some(LibrespotEvent::EndOfTrack { .. })) => break,
+                Ok(Some(LibrespotEvent::Unavailable { .. })) => {
+                    let _ = spirc.shutdown();
+                    return Err(NATIVE_AUDIO_KEY_LIMIT.to_string());
+                }
+                Ok(None) => break,
+                Ok(Some(_)) => {}
+                Err(_) => {}
+            }
+            if position_ms >= 61_000 {
+                break;
+            }
+        }
+        let _ = spirc.shutdown();
+        if !playing || position_ms <= 60_000 {
+            return Err(format!(
+                "native playback did not pass 60 s (playing={playing}, position_ms={position_ms})"
+            ));
+        }
+        Ok(format!(
+            "native_play=ok uri={uri} playing={playing} position_ms={position_ms} device={DEVICE_NAME}\n"
+        ))
     })
 }
 

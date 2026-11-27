@@ -98,14 +98,18 @@ Client ID is already filled in.
 
 Rustify tries three engines in order, so a missing one never drops a song to a preview:
 
-1. **librespot** — the built-in native player. When the Spotify sign-in can register a Connect
-   device, full songs stream inside Rustify as **Rustify (native)**. Spotify does not allow every
-   OAuth token to use Connect (keymaster), so this step can be unavailable without breaking the app.
+1. **librespot** — the built-in native player. Settings > Playback has **Set up native player**,
+   which opens Spotify's keymaster consent page and stores a reusable credential sealed with
+   Windows DPAPI. This is what registers **Rustify (native)**; a Web API token cannot.
+   Spotify refuses audio decryption keys for accounts created after its 2024/25 cutoff, even
+   when the Connect device registers. That is a librespot limitation (upstream issue #1649), not
+   a login failure; Rustify says so and moves to the next engine.
 2. **spotifyd** — if a spotifyd daemon is installed and running on this PC, Rustify hands playback
-   to its Connect device instead. Nothing is downloaded or bundled.
+   to its Connect device instead. spotifyd is also librespot-based, so newer accounts hit the same
+   audio-key refusal.
 3. **rspotify (Spotify app)** — otherwise the Web API controls whichever Spotify client is awake
-   on the account. Rustify opens the desktop app when it needs a device. This is the engine used
-   when librespot cannot register a device; the banner offers **Open Spotify**.
+   on the account. Rustify opens the desktop app when it needs a device. The banner offers
+   **Open Spotify**. This is the full-song engine for accounts affected by the librespot cutoff.
 
 Only when none of the three is available does a row play the official 30-second preview. The
 line under the player-bar title names the engine that is actually playing.
